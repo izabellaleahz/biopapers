@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>biopapers</title>
+  <style>
+    :root {
+      --bg:#faf7fb; --card:#ffffff; --ink:#3a3446; --muted:#8c8798;
+      --line:#ece7f2; --shadow:0 1px 2px rgba(80,60,110,.05), 0 4px 16px rgba(80,60,110,.05);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#1a171f; --card:#242029; --ink:#e9e4f0; --muted:#9a94a6;
+              --line:#332e3c; --shadow:0 1px 2px rgba(0,0,0,.2), 0 4px 16px rgba(0,0,0,.25); }
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink);
+           font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+    .wrap { max-width:840px; margin:0 auto; padding:0 20px; }
+
+    /* ---- header ---- */
+    header { padding:28px 0 4px; }
+    h1 { margin:0; font-size:26px; font-weight:700; letter-spacing:-.02em;
+         background:linear-gradient(100deg,#e88aa6,#a98fd6 45%,#6bb6e6);
+         -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+    .sub { color:var(--muted); font-size:13px; margin-top:2px; }
+
+    /* ---- sticky nav ---- */
+    .bar { position:sticky; top:0; z-index:10; background:color-mix(in srgb, var(--bg) 88%, transparent);
+           backdrop-filter:blur(8px); border-bottom:1px solid var(--line); margin-top:14px; }
+    nav { display:flex; flex-wrap:wrap; gap:8px; padding:12px 0; align-items:center; }
+    .pill { --c:var(--muted); display:inline-flex; align-items:center; gap:7px; cursor:pointer;
+            text-decoration:none; color:var(--ink); font-size:13px; font-weight:500;
+            border:1px solid var(--line); background:var(--card); padding:5px 12px; border-radius:999px;
+            transition:transform .08s ease, box-shadow .12s ease; }
+    .pill:hover { transform:translateY(-1px); box-shadow:var(--shadow); }
+    .pill .dot { width:9px; height:9px; border-radius:50%; background:var(--c); flex:0 0 auto; }
+    .pill .n { color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+    .pill.active { background:color-mix(in srgb, var(--c) 20%, var(--card));
+                   border-color:color-mix(in srgb, var(--c) 55%, var(--card)); font-weight:600; }
+    .pill.active .n { color:color-mix(in srgb, var(--c) 55%, var(--ink)); }
+
+    .sortbar { display:flex; gap:14px; padding:12px 0 4px; font-size:13px; color:var(--muted); }
+    .sortbar a { color:var(--muted); text-decoration:none; padding-bottom:2px; }
+    .sortbar a.active { color:var(--ink); font-weight:600; border-bottom:2px solid var(--ink); }
+
+    /* ---- cards ---- */
+    main { padding:6px 0 64px; }
+    .paper { --c:var(--muted); position:relative; display:flex; gap:14px;
+             background:var(--card); border:1px solid var(--line); border-left:4px solid var(--c);
+             border-radius:14px; padding:15px 17px; margin-bottom:12px; box-shadow:var(--shadow); }
+    .vote { flex:0 0 auto; display:flex; flex-direction:column; align-items:center; gap:3px; }
+    .vote button { cursor:pointer; border:1px solid var(--line); border-radius:10px; width:42px; height:36px;
+                   font-size:15px; line-height:1; color:var(--muted); background:var(--bg);
+                   transition:all .12s ease; }
+    .vote button:hover { color:var(--c); border-color:var(--c);
+                         background:color-mix(in srgb, var(--c) 14%, var(--card)); transform:translateY(-1px); }
+    .vote .count { font-weight:700; font-size:15px; font-variant-numeric:tabular-nums; }
+    .body { min-width:0; }
+    .body h3 { margin:0 0 5px; font-size:16px; line-height:1.35; }
+    .body h3 a { color:var(--ink); text-decoration:none; }
+    .body h3 a:hover { color:var(--c); }
+    .meta { color:var(--muted); font-size:12px; margin-bottom:7px; display:flex; flex-wrap:wrap;
+            gap:6px; align-items:center; }
+    .authors { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .badge { display:inline-flex; align-items:center; gap:5px; border-radius:7px; padding:2px 9px;
+             font-size:11px; font-weight:600; background:color-mix(in srgb, var(--c) 22%, var(--card));
+             color:color-mix(in srgb, var(--c) 60%, var(--ink)); }
+    .date { font-variant-numeric:tabular-nums; }
+    .abstract { color:var(--muted); font-size:13px; line-height:1.5; max-height:4.4em; overflow:hidden;
+                mask-image:linear-gradient(#000 60%,transparent); }
+    .empty { color:var(--muted); text-align:center; padding:56px 0; }
+    code { background:var(--line); padding:1px 6px; border-radius:5px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>biopapers</h1>
+      <div class="sub">Recent bioRxiv preprints · Gilbert-lab topics · upvote what's interesting</div>
+    </header>
+  </div>
+
+  <div class="bar">
+    <div class="wrap">
+      <nav>
+        <a href="/?sort={{ sort }}" class="pill {{ 'active' if not active_topic else '' }}">
+          <span class="dot" style="--c:var(--ink)"></span>All <span class="n">{{ counts.get('all', 0) }}</span>
+        </a>
+        {% for slug, t in topics.items() %}
+          <a href="/?topic={{ slug }}&sort={{ sort }}"
+             class="pill {{ 'active' if active_topic == slug else '' }}" style="--c:{{ t.color }}">
+            <span class="dot"></span>{{ t.label }} <span class="n">{{ counts.get(slug, 0) }}</span>
+          </a>
+        {% endfor %}
+      </nav>
+      <div class="sortbar">
+        <a href="/?{{ ('topic=' + active_topic + '&') if active_topic else '' }}sort=votes"
+           class="{{ 'active' if sort == 'votes' else '' }}">★ Top</a>
+        <a href="/?{{ ('topic=' + active_topic + '&') if active_topic else '' }}sort=date"
+           class="{{ 'active' if sort == 'date' else '' }}">✦ Newest</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <main>
+      {% if not papers %}
+        <div class="empty">No papers yet. Run <code>python ingest.py</code> to pull from bioRxiv.</div>
+      {% endif %}
+      {% for p in papers %}
+        {% set c = topics[p.topic].color if p.topic in topics else 'var(--muted)' %}
+        <article class="paper" style="--c:{{ c }}">
+          <div class="vote">
+            <button aria-label="upvote" onclick="upvote({{ p.id }}, this)">▲</button>
+            <span class="count" id="count-{{ p.id }}">{{ p.votes }}</span>
+          </div>
+          <div class="body">
+            <h3><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.title }}</a></h3>
+            <div class="meta">
+              <span class="badge"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:{{ c }}"></span>{{ topics[p.topic].label if p.topic in topics else p.category }}</span>
+              <span class="date">{{ p.date }}</span>
+            </div>
+            <div class="authors meta">{{ p.authors }}</div>
+            <div class="abstract">{{ p.abstract }}</div>
+          </div>
+        </article>
+      {% endfor %}
+    </main>
+  </div>
+
+  <script>
+    async function upvote(id, btn) {
+      btn.disabled = true;
+      try {
+        const r = await fetch(`/upvote/${id}`, { method: "POST" });
+        if (r.ok) document.getElementById(`count-${id}`).textContent = await r.text();
+      } finally {
+        setTimeout(() => (btn.disabled = false), 250);
+      }
+    }
+  </script>
+</body>
+</html>
