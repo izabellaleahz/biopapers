@@ -38,10 +38,10 @@ TOPICS = {
     },
 }
 
-# Flat set of every category we care about (union of all topics), lowercased.
-INTERESTING_CATEGORIES = {
-    cat.lower()
-    for topic in TOPICS.values()
+# bioRxiv category (lowercased) -> topic slug, precomputed once at import.
+CATEGORY_TO_TOPIC = {
+    cat.lower(): slug
+    for slug, topic in TOPICS.items()
     for cat in topic["categories"]
 }
 
@@ -50,8 +50,4 @@ def topic_for_category(category: str) -> str | None:
     """Return the topic slug a bioRxiv category belongs to, or None."""
     if not category:
         return None
-    cat = category.lower().strip()
-    for slug, topic in TOPICS.items():
-        if cat in (c.lower() for c in topic["categories"]):
-            return slug
-    return None
+    return CATEGORY_TO_TOPIC.get(category.lower().strip())

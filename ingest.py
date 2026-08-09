@@ -26,6 +26,11 @@ def build_url(doi: str, version: str | None) -> str:
     return f"https://www.biorxiv.org/content/{doi}{v}"
 
 
+def _text(record: dict, key: str) -> str:
+    """A trimmed string field from a bioRxiv record, tolerant of nulls."""
+    return (record.get(key) or "").strip()
+
+
 def fetch_recent(days: int) -> list[dict]:
     """Fetch raw preprint records from the last N days, paging through the cursor."""
     end = dt.date.today()
@@ -63,11 +68,11 @@ def ingest(days: int) -> tuple[int, int]:
                 continue  # not a lab topic — skip for v0
             paper = {
                 "doi": r.get("doi"),
-                "title": (r.get("title") or "").strip(),
-                "authors": (r.get("authors") or "").strip(),
-                "category": (r.get("category") or "").strip(),
+                "title": _text(r, "title"),
+                "authors": _text(r, "authors"),
+                "category": _text(r, "category"),
                 "topic": topic,
-                "abstract": (r.get("abstract") or "").strip(),
+                "abstract": _text(r, "abstract"),
                 "date": r.get("date"),
                 "url": build_url(r.get("doi", ""), r.get("version")),
                 "fetched_at": fetched_at,

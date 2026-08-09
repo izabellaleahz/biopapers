@@ -87,8 +87,7 @@ def counts_by_topic() -> dict[str, int]:
 def add_vote(paper_id: int) -> int | None:
     """Increment a paper's vote count; return the new total (or None if not found)."""
     with connect() as conn:
-        cur = conn.execute("UPDATE papers SET votes = votes + 1 WHERE id = ?", (paper_id,))
-        if cur.rowcount == 0:
-            return None
-        row = conn.execute("SELECT votes FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        row = conn.execute(
+            "UPDATE papers SET votes = votes + 1 WHERE id = ? RETURNING votes", (paper_id,)
+        ).fetchone()
         return row["votes"] if row else None

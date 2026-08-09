@@ -9,7 +9,7 @@ Run:
 
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 
@@ -50,5 +50,5 @@ def upvote(paper_id: int):
     """Increment a paper's votes; returns the new count (consumed by the page JS)."""
     new_total = db.add_vote(paper_id)
     if new_total is None:
-        return PlainTextResponse("not found", status_code=404)
-    return PlainTextResponse(str(new_total))
+        raise HTTPException(status_code=404, detail="paper not found")
+    return str(new_total)

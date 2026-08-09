@@ -94,11 +94,10 @@
           </a>
         {% endfor %}
       </nav>
+      {% set tq = ('topic=' + active_topic + '&') if active_topic else '' %}
       <div class="sortbar">
-        <a href="/?{{ ('topic=' + active_topic + '&') if active_topic else '' }}sort=votes"
-           class="{{ 'active' if sort == 'votes' else '' }}">★ Top</a>
-        <a href="/?{{ ('topic=' + active_topic + '&') if active_topic else '' }}sort=date"
-           class="{{ 'active' if sort == 'date' else '' }}">✦ Newest</a>
+        <a href="/?{{ tq }}sort=votes" class="{{ 'active' if sort == 'votes' else '' }}">★ Top</a>
+        <a href="/?{{ tq }}sort=date" class="{{ 'active' if sort == 'date' else '' }}">✦ Newest</a>
       </div>
     </div>
   </div>
@@ -118,7 +117,7 @@
           <div class="body">
             <h3><a href="{{ p.url }}" target="_blank" rel="noopener">{{ p.title }}</a></h3>
             <div class="meta">
-              <span class="badge"><span class="dot" style="width:8px;height:8px;border-radius:50%;background:{{ c }}"></span>{{ topics[p.topic].label if p.topic in topics else p.category }}</span>
+              <span class="badge"><span class="dot"></span>{{ topics[p.topic].label if p.topic in topics else p.category }}</span>
               <span class="date">{{ p.date }}</span>
             </div>
             <div class="authors meta">{{ p.authors }}</div>
