@@ -1,0 +1,20 @@
+# PI watchlist — every new paper with one of these people as an author shows
+# up in the "PI Watch" tab, gets a boost in For You, and lands in alerts.xml.
+#
+#   name      — "First Last"; matched against author lists (last name + first initial)
+#   openalex  — OpenAlex author ID; also pulls their papers from journals we don't
+#               have feeds for. Find it at https://api.openalex.org/authors?search=<name>
+#   note      — free text, shown on hover
+
+people:
+  - name: Caroline Uhler
+    openalex: A5008891620
+    note: MIT / Broad — causal ML, single-cell
+
+  - name: Nir Hacohen
+    openalex: A5048859270
+    note: Broad / MGH — tumor immunology, innate immunity
+
+  - name: Stefani Spranger
+    openalex: A5013574777
+    note: MIT Koch — cancer immunology, T cell priming

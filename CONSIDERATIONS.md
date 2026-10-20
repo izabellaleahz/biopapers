@@ -27,6 +27,18 @@ Barebones proof-of-concept shipped — FastAPI + SQLite, bioRxiv only. See `READ
 **Deliberately deferred to v1** (the interesting stuff): auth + per-user votes, comments / journal-club queue,
 multi-source ingest (Nature/Cell/Science + medRxiv + aggregators), LLM/embedding relevance scoring, TL;DRs.
 
+### 🛠️ Built: v1 static site (2026-10-16)
+- **Hosting:** GitHub Pages, rebuilt daily by a GitHub Action. FastAPI + SQLite retired.
+- **Votes/saves:** per-browser localStorage for now (option A). Upgrade paths: private-Gist sync (B)
+  or Supabase + GitHub login for shared lab votes (C).
+- **Sources:** bioRxiv, medRxiv, arXiv, ~35 journal RSS feeds, OpenAlex (ISSN journals, PI watchlist,
+  niche-topic search). Buzz = HN + Bluesky + ScienceDaily (X/Twitter API isn't free).
+- **New topics:** B cells & antibodies, PhIP-seq, viral mimicry, trogocytosis, CRISPR & Perturb-seq.
+- **PI watchlist:** Caroline Uhler, Nir Hacohen, Stefani Spranger (`config/people.yaml`).
+- **Ranking:** user-tunable weighted blend (recency / buzz / PI / similarity-to-saves / upvotes), per-topic weights.
+- **Alerts:** `alerts.xml` RSS feed of PI + buzz hits.
+- **Next up:** embeddings for "For You" similarity, LLM TL;DRs, email/Slack push alerts, shared votes.
+
 ---
 
 ## 1. The Feed — "what's new and interesting" (crowdsourcing)

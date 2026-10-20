@@ -1,0 +1,75 @@
+# Where papers come from. Add/remove freely; a source that errors is logged and skipped.
+#
+#   preprints — bioRxiv / medRxiv (official API) and arXiv (export API)
+#   rss       — journal RSS/Atom feeds: journal name -> feed URL
+#   openalex  — journals whose RSS is blocked/missing, pulled from OpenAlex by ISSN
+#               (OpenAlex lags publication by a few days)
+#   buzz      — social / media attention signals (see pipeline/sources/buzz.py)
+
+preprints:
+  biorxiv: true
+  medrxiv: true
+  # arXiv: q-bio is kept wholesale; the ML categories are only kept when a paper
+  # matches some topic keyword (otherwise cs.LG would swamp the feed).
+  arxiv_keep_all: [q-bio]
+  arxiv_keyword_only: [cs.LG, stat.ML]
+
+rss:
+  # Nature family
+  Nature: https://www.nature.com/nature.rss
+  Nature Immunology: https://www.nature.com/ni.rss
+  Nature Cancer: https://www.nature.com/natcancer.rss
+  Nature Microbiology: https://www.nature.com/nmicrobiol.rss
+  Nature Biotechnology: https://www.nature.com/nbt.rss
+  Nature Methods: https://www.nature.com/nmeth.rss
+  Nature Genetics: https://www.nature.com/ng.rss
+  Nature Medicine: https://www.nature.com/nm.rss
+  Nature Communications: https://www.nature.com/ncomms.rss
+  Nature Machine Intelligence: https://www.nature.com/natmachintell.rss
+  Nature Reviews Immunology: https://www.nature.com/nri.rss
+  # Cell Press
+  Cell: https://www.cell.com/cell/inpress.rss
+  Immunity: https://www.cell.com/immunity/inpress.rss
+  Cancer Cell: https://www.cell.com/cancer-cell/inpress.rss
+  Cell Host & Microbe: https://www.cell.com/cell-host-microbe/inpress.rss
+  Molecular Cell: https://www.cell.com/molecular-cell/inpress.rss
+  Cell Genomics: https://www.cell.com/cell-genomics/inpress.rss
+  Cell Systems: https://www.cell.com/cell-systems/inpress.rss
+  Cell Reports: https://www.cell.com/cell-reports/inpress.rss
+  # Science family
+  Science: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science
+  Science Immunology: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=sciimmunol
+  Science Advances: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=sciadv
+  Science Translational Medicine: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=stm
+  # Others
+  eLife: https://elifesciences.org/rss/recent.xml
+  PNAS: https://www.pnas.org/action/showFeed?type=etoc&feed=rss&jc=pnas
+  JEM: https://rupress.org/rss/site_1000003/1000004.xml
+  Cancer Discovery: https://aacrjournals.org/rss/site_1000003/1000004.xml
+  Nucleic Acids Research: https://academic.oup.com/rss/site_5127/3091.xml
+  Genome Research: https://genome.cshlp.org/rss/current.xml
+  PLOS Biology: https://journals.plos.org/plosbiology/feed/atom
+  PLOS Pathogens: https://journals.plos.org/plospathogens/feed/atom
+  PLOS Computational Biology: https://journals.plos.org/ploscompbiol/feed/atom
+
+openalex:
+  mBio: 2150-7511
+  Journal of Virology: 0022-538X
+  Blood: 0006-4971
+  Genome Biology: 1474-760X
+  EMBO Journal: 0261-4189
+
+ml:
+  # ML / CS section. Every new arXiv paper in these categories is kept for `firehose_days`;
+  # after that only ones with Hugging Face upvotes or social buzz stay (keeps the data small).
+  arxiv: [cs.LG, cs.AI, cs.CL, cs.CV, cs.RO, cs.MA, stat.ML]
+  firehose_days: 3
+  huggingface: true     # HF Daily Papers — curated, with upvotes, AI TL;DRs, GitHub links
+  huggingface_days: 30
+
+buzz:
+  hackernews: true      # HN stories linking to papers (free Algolia API)
+  sciencedaily: true    # press coverage — ScienceDaily top stories, resolved to DOIs
+  bluesky: true         # posts sharing paper links. Works unauthenticated (thin);
+                        # set BSKY_HANDLE + BSKY_APP_PASSWORD env/secrets for much better coverage
+  lookback_days: 7

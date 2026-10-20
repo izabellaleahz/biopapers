@@ -1,0 +1,204 @@
+# Interest tabs. Each topic becomes a tab; a paper can land in several.
+#
+# A paper is tagged with a topic if ANY of these match:
+#   categories      — bioRxiv / medRxiv subject category (case-insensitive)
+#   arxiv           — arXiv category prefix ("q-bio" matches q-bio.GN, q-bio.QM, ...)
+#   venues          — journal name, exactly as written in sources.yaml
+#   keywords        — searched in title + abstract. Use for specific terms.
+#   title_keywords  — searched in the title only. Use for broad words ("cancer",
+#                     "antibody") that appear in passing in lots of abstracts.
+#
+# Keyword matching: case-insensitive prefix match at a word start ("trogocyt" hits
+# trogocytosis / trogocytic). Short ALL-CAPS keywords (≤5 chars: ERV, TCR, CD8) match
+# case-sensitively as whole words (plural ok) so they don't hit unrelated words.
+#
+#   openalex_search — phrases searched across ALL of the literature via OpenAlex
+#                     (title + abstract), not just our feeds. Use for niche topics
+#                     where the papers are scattered across many journals.
+#
+#   section         — "bio" (default) or "ml": which top-level section the tab lives in
+#
+# Edits take effect on the next pipeline run (re-tags everything already collected).
+# `color` is the pastel accent for the tab + card edge.
+
+# Top-level sections (the Bio | ML / CS switcher). Topics default to section "bio".
+# `only_venues` limits a section's topics to papers from those venues — so a bioRxiv
+# paper mentioning "protein" doesn't land in ML's "AI for Science" tab.
+sections:
+  bio:
+    label: Bio
+  ml:
+    label: ML / CS
+    only_venues: [arXiv]
+
+topics:
+  - slug: cancer
+    label: Cancer Biology
+    color: "#e88aa6"
+    categories: [cancer biology, oncology]
+    venues: [Cancer Cell, Nature Cancer, Cancer Discovery]
+    keywords: [neoantigen, "tumor microenvironment", "tumour microenvironment", "immune checkpoint"]
+    title_keywords: [tumor, tumour, cancer, oncogen, carcinoma, metasta, leukemia, leukaemia,
+                     lymphoma, melanoma, glioblastoma, glioma, sarcoma, myeloma]
+
+  - slug: tcell
+    label: Immunology / T cell
+    color: "#a98fd6"
+    categories: [immunology, allergy and immunology]
+    venues: [Immunity, Nature Immunology, Science Immunology, JEM, Nature Reviews Immunology]
+    keywords: ["T cell exhaustion", "regulatory T cell", "tissue-resident memory", "CAR T", "CAR-T",
+               "T cell receptor", "cytotoxic T"]
+    title_keywords: ["T cell", "T-cell", "T lymphocyte", TCR, CD8, CD4, Treg, immun]
+
+  - slug: bcell
+    label: B cells & Antibodies
+    color: "#f2b15c"
+    keywords: ["germinal center", "germinal centre", "plasma cell", plasmablast, "humoral immun",
+               "somatic hypermutation", "class switch", "broadly neutralizing antibod",
+               "antibody repertoire", "B cell receptor", "memory B cell"]
+    title_keywords: ["B cell", "B-cell", "B lymphocyte", antibod, immunoglobulin, nanobod, IgG, IgA,
+                     IgE, bNAb]
+
+  - slug: phipseq
+    label: PhIP-seq
+    color: "#d98ad9"
+    keywords: [PhIP-seq, PhIPseq, "phage immunoprecipitation", VirScan, "phage-displayed peptidome",
+               "peptidome-wide", "proteome-wide autoantibod", "antibody epitope repertoire",
+               "linear epitope profiling"]
+    title_keywords: ["phage display", "epitope mapping", "epitope profiling", "phage library"]
+    openalex_search: ['"PhIP-seq"', '"phage immunoprecipitation sequencing"', 'VirScan']
+
+  - slug: viralmimicry
+    label: Viral Mimicry
+    color: "#7fc97f"
+    keywords: ["viral mimicry", "endogenous retrovir", ERV, "transposable element", "LINE-1",
+               "repeat element", "dsRNA sensing", "double-stranded RNA sensing", "Z-RNA", ZBP1,
+               ADAR1, MDA5]
+    title_keywords: [retrotranspos, dsRNA, "double-stranded RNA", cGAS, STING]
+    openalex_search: ['"viral mimicry"']
+
+  - slug: trogocytosis
+    label: Trogocytosis
+    color: "#f08a6c"
+    keywords: [trogocyt, "membrane transfer between", "antigen transfer between cells"]
+    openalex_search: [trogocytosis]
+
+  - slug: microbiology
+    label: Micro & Viral
+    color: "#5cc0a0"
+    categories: [microbiology, infectious diseases]
+    venues: [Nature Microbiology, Cell Host & Microbe, mBio, Journal of Virology, PLOS Pathogens]
+    keywords: ["host-pathogen", "antiviral immun", "viral replication"]
+    title_keywords: [virus, viral, virolog, bacteri, microbio, microbiome, pathogen, phage, infection]
+
+  - slug: molecular
+    label: Molecular Biology
+    color: "#eea777"
+    categories: [molecular biology, biochemistry, genetics, genomics]
+    venues: [Molecular Cell, Nucleic Acids Research, EMBO Journal, Genome Research, Genome Biology,
+             Cell Genomics, Nature Genetics]
+    title_keywords: ["transcription factor", chromatin, "gene regulation", enhancer, "RNA binding",
+                     epigen]
+
+  - slug: screens
+    label: CRISPR & Perturb-seq
+    color: "#c9a0dc"
+    keywords: [Perturb-seq, "CRISPR screen", CRISPRi, CRISPRa, "genetic screen", "pooled screen",
+               "functional genomics", "single-cell perturbation", "genome-wide screen",
+               "base editing screen", "CRISPR interference", "CRISPR activation"]
+    openalex_search: ['"Perturb-seq"']
+
+  - slug: bioml
+    label: Bio ML
+    color: "#6bb6e6"
+    categories: [bioinformatics, systems biology]
+    arxiv: [q-bio]
+    venues: [Nature Machine Intelligence, Cell Systems, PLOS Computational Biology, Nature Methods]
+    # Bio-specific terms only — generic ML words ("transformer", "deep learning") would pull the
+    # whole arXiv ML firehose into this tab. That's what the ML / CS section is for.
+    keywords: ["single-cell foundation", "virtual cell", "protein language model", "protein design",
+               "genomic language model", "DNA language model", "perturbation prediction",
+               "gene expression prediction", "cell state prediction", "biological foundation model",
+               "foundation model for biology", "spatial transcriptomics", "single-cell RNA"]
+    title_keywords: ["single-cell", scRNA, "protein structure", "drug discovery", genomic, "biomedical"]
+
+  # ---- ML / CS section (alphaXiv-style). arXiv categories + keywords; Hugging Face's
+  # ---- AI-generated keywords for each paper are matched too.
+
+  - slug: llm
+    section: ml
+    label: LLMs & Reasoning
+    color: "#6bb6e6"
+    arxiv: [cs.CL]
+    keywords: ["large language model", LLM, "chain-of-thought", "chain of thought", "instruction tuning",
+               "in-context learning", RLHF, "preference optimization", "test-time compute",
+               "test-time scaling"]
+    title_keywords: ["language model", reasoning, tokeniz]
+
+  - slug: agents
+    section: ml
+    label: Agents & RL
+    color: "#a98fd6"
+    arxiv: [cs.MA]
+    keywords: ["reinforcement learning", "tool use", "tool-use", "multi-agent", "agentic", "reward model",
+               "web agent", "computer-use", "coding agent", GRPO]
+    title_keywords: [agent, policy]
+
+  - slug: vision
+    section: ml
+    label: Vision & Multimodal
+    color: "#e88aa6"
+    arxiv: [cs.CV]
+    keywords: ["vision-language", "vision language", multimodal, "multi-modal", VLM, "text-to-image",
+               "text-to-video", "video generation", "image generation", "Gaussian splatting"]
+    title_keywords: [visual, image, video, "3D", segmentation]
+
+  - slug: generative
+    section: ml
+    label: Generative Models
+    color: "#eea777"
+    keywords: ["diffusion model", "flow matching", "score-based", "normalizing flow", "consistency model",
+               "discrete diffusion", "masked diffusion"]
+    title_keywords: [diffusion, generative, "autoregressive"]
+
+  - slug: robotics
+    section: ml
+    label: Robotics & Embodied
+    color: "#5cc0a0"
+    arxiv: [cs.RO]
+    keywords: ["vision-language-action", VLA, "embodied", locomotion, "dexterous"]
+    title_keywords: [robot, manipulation]
+
+  - slug: interp
+    section: ml
+    label: Interpretability & Safety
+    color: "#f08a6c"
+    keywords: [interpretab, "mechanistic", "sparse autoencoder", "AI safety", jailbreak, "red-teaming",
+               "red teaming", "reward hacking", "deceptive", "sandbagging", "activation steering",
+               "chain-of-thought monitor"]
+    title_keywords: [alignment, safety, steering, "probing"]
+
+  - slug: efficiency
+    section: ml
+    label: Systems & Efficiency
+    color: "#c9a0dc"
+    arxiv: [cs.DC, cs.AR, cs.PF]
+    keywords: [quantiz, "mixture of experts", "mixture-of-experts", MoE, "KV cache", "speculative decoding",
+               "distributed training", "long-context", "long context", "sparse attention", "linear attention"]
+    title_keywords: [efficient, inference, pruning, distillation, compression]
+
+  - slug: theory
+    section: ml
+    label: Theory & Optimization
+    color: "#f2b15c"
+    arxiv: [math.OC, stat.TH]
+    keywords: ["scaling law", "generalization bound", "sample complexity", "regret bound", "theoretical analysis"]
+    title_keywords: [convergence, optimization, theory, "provabl", "learning theory"]
+
+  - slug: aisci
+    section: ml
+    label: AI for Science
+    color: "#7fc97f"
+    keywords: ["AI for science", "scientific discovery", "drug discovery", "physics-informed", "weather forecast",
+               "materials discovery", "protein", "single-cell", "molecular generation"]
+    title_keywords: [molecul, protein, materials, climate, weather, "scientific", genom, biolog]
