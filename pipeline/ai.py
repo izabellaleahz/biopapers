@@ -156,16 +156,17 @@ def collect(client, batch: dict, by_id: dict[str, dict], log) -> None:
         f"{usage['input'] + usage['cache_read'] + usage['cache_write']:,} in / {usage['output']:,} out tokens ≈ ${cost:.2f}")
 
 
-def openrouter_call(c: httpx.Client, system: str, chunk: list[dict]) -> dict:
+def openrouter_json(c: httpx.Client, system: str, user: str, schema: dict, max_tokens: int = 8000) -> dict:
+    """One OpenRouter chat completion constrained to `schema`; returns the raw response JSON."""
     body = {
         "model": OPENROUTER_MODEL,
-        "max_tokens": 8000,
+        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]},
-            {"role": "user", "content": user_message(chunk)},
+            {"role": "user", "content": user},
         ],
         "reasoning": {"effort": "low"},
-        "response_format": {"type": "json_schema", "json_schema": {"name": "scores", "strict": True, "schema": SCHEMA}},
+        "response_format": {"type": "json_schema", "json_schema": {"name": "answer", "strict": True, "schema": schema}},
         "usage": {"include": True},  # adds the request's cost in $ to `usage`
     }
     for attempt in range(4):
@@ -176,6 +177,31 @@ def openrouter_call(c: httpx.Client, system: str, chunk: list[dict]) -> dict:
         if resp.is_error:
             raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:300]}")
         return resp.json()
+
+
+def openrouter_call(c: httpx.Client, system: str, chunk: list[dict]) -> dict:
+    return openrouter_json(c, system, user_message(chunk), SCHEMA)
+
+
+def complete_json(system: str, user: str, schema: dict) -> dict | None:
+    """A single structured answer from Haiku 5.5 through whichever key is set (None with neither,
+    or if the call fails). For small jobs like naming map regions."""
+    try:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            import anthropic
+
+            msg = anthropic.Anthropic().messages.create(
+                model=MODEL, max_tokens=8000, system=system, messages=[{"role": "user", "content": user}],
+                output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}})
+            return json.loads(next(b.text for b in msg.content if b.type == "text")) if msg.stop_reason == "end_turn" else None
+        if os.environ.get("OPENROUTER_API_KEY"):
+            headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "X-Title": "biopapers"}
+            with httpx.Client(timeout=180, headers=headers) as c:
+                choice = openrouter_json(c, system, user, schema)["choices"][0]
+            return json.loads(choice["message"]["content"]) if choice.get("finish_reason") == "stop" else None
+    except Exception as ex:
+        print(f"  ai: complete_json failed: {str(ex)[:200]}", flush=True)
+    return None
 
 
 def run_openrouter(todo: list[dict], system: str, by_id: dict[str, dict], log) -> None:

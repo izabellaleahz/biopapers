@@ -75,7 +75,10 @@ export/import of your data, saved → BibTeX.
   Haiku 5.5 there; results are cached and synced, so each paper is paid for once.
 - **Embeddings** — bge-small-en-v1.5 over title + abstract, computed on the Actions runner (free).
   They power "Similar to what I save / upvote" in For You and the **similar papers** button.
-- **Graph** — its own view next to Bio | ML / CS: a UMAP layout of the embeddings, colored by topic.
+- **Graph** — its own view next to Bio | ML / CS: a UMAP layout of the embeddings, colored by topic,
+  with ~30 named regions (k-means on the layout, named by Haiku; a region keeps its name while most of
+  its papers stay). Each day's layout starts from yesterday's and is aligned back onto it, so the map
+  stays put and new papers settle in next to their neighbours.
   ♥ favorites are labelled hubs; "around favorites" narrows it to them plus the 25 papers closest to
   each. Click any dot to see it and the 20 papers most like it.
 - **♥ Favorites** — landmark papers, separate from saves. ♥ any card, or look up *any* paper in the

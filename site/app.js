@@ -606,7 +606,7 @@ $("search").addEventListener("input", (e) => {
 
 const mapView = { k: 1, tx: 0, ty: 0 };
 let mapSel = null, mapHover = null, mapFocus = null, mapPts = [], mapSize = { w: 0, h: 0, s: 0 };
-let mapAllLinks = false, mapNeedsFit = true, lookupResults = [];
+let mapAllLinks = false, mapNeedsFit = true, lookupResults = [], mapRegions = true, regionCounts = [];
 let placeStatus = null, placing = null, extractor = null; // in-browser embedding of new favorites
 
 function showOnMap(p) {
@@ -633,8 +633,10 @@ function sizeMap() {
 }
 
 // Layout coords (0..1) -> CSS pixels, before and after pan/zoom.
-const mapBase = (i) => [(mapSize.w - mapSize.s) / 2 + MAP.xy[i][0] * mapSize.s, (mapSize.h - mapSize.s) / 2 + MAP.xy[i][1] * mapSize.s];
-const mapScreen = (i) => { const [x, y] = mapBase(i); return [x * mapView.k + mapView.tx, y * mapView.k + mapView.ty]; };
+const xyBase = (x, y) => [(mapSize.w - mapSize.s) / 2 + x * mapSize.s, (mapSize.h - mapSize.s) / 2 + y * mapSize.s];
+const mapBase = (i) => xyBase(MAP.xy[i][0], MAP.xy[i][1]);
+const toScreen = ([x, y]) => [x * mapView.k + mapView.tx, y * mapView.k + mapView.ty];
+const mapScreen = (i) => toScreen(mapBase(i));
 
 function fitMap(indexes) {
   if (!indexes.length) { Object.assign(mapView, { k: 1, tx: 0, ty: 0 }); return; }
@@ -678,6 +680,8 @@ function renderGraph() {
     mapPts.push({ i, p, fav, near: near.get(id), color: topic?.color || (p.pis?.length ? "#a98fd6" : muted),
                   liked: isLiked(p), dim: !matchesGraph(p) });
   });
+  regionCounts = (MAP.regions || []).map(() => 0);
+  for (const q of mapPts) if (MAP.c?.[q.i] != null) regionCounts[MAP.c[q.i]]++;
   if (mapFocus) {
     const i = MAP.index.get(mapFocus);
     if (i !== undefined) {
@@ -733,6 +737,24 @@ function drawMap() {
     }
   }
   ctx.textBaseline = "middle";
+  if (mapRegions && !around) {
+    // Region names (pipeline/layout.py), skipped where the current filter leaves the region mostly empty.
+    // Biggest regions first; a label that would overlap one already drawn is skipped (zoom in to see it).
+    const muted = cssVar("--muted"), drawn = [];
+    ctx.textAlign = "center";
+    (MAP.regions || []).map((reg, c) => [reg, c]).sort((a, b) => regionCounts[b[1]] - regionCounts[a[1]]).forEach(([reg, c]) => {
+      if (!reg.label || regionCounts[c] < Math.max(8, reg.n * 0.3)) return;
+      const [x, y] = toScreen(xyBase(reg.x, reg.y));
+      if (x < 0 || y < 0 || x > w || y > h) return;
+      const size = Math.round(10 + Math.min(4, Math.sqrt(regionCounts[c]) / 6));
+      ctx.font = `600 ${size}px system-ui, sans-serif`;
+      const half = ctx.measureText(reg.label).width / 2 + 4, box = [x - half, y - size, x + half, y + size];
+      if (drawn.some((d) => box[0] < d[2] && box[2] > d[0] && box[1] < d[3] && box[3] > d[1])) return;
+      drawn.push(box);
+      ctx.globalAlpha = 0.95; ctx.lineWidth = 4; ctx.strokeStyle = card; ctx.strokeText(reg.label, x, y);
+      ctx.fillStyle = muted; ctx.fillText(reg.label, x, y);
+    });
+  }
   for (const q of mapPts) {
     if (!q.fav) continue;
     const [x, y] = mapScreen(q.i);
@@ -800,6 +822,7 @@ function addToGraph(id, vec) {
   for (const [sim, i] of top) { const k = Math.max(sim, 0) ** 4; x += MAP.xy[i][0] * k; y += MAP.xy[i][1] * k; w += k; }
   VEC = { ...VEC, data, norms }; VEC.index.set(id, n);
   MAP.ids.push(id); MAP.xy.push([x / (w || 1), y / (w || 1)]); MAP.nn.push(top.map(([, i]) => i)); MAP.index.set(id, n);
+  MAP.c?.push(MAP.c[top[0][1]]);
 }
 
 function placeFavorites() {
@@ -1029,6 +1052,7 @@ $("graph-around").addEventListener("change", (e) => {
   c.addEventListener("pointercancel", (e) => { pointers.delete(e.pointerId); drag = null; pinch = null; });
   c.addEventListener("pointerleave", () => { tip.hidden = true; if (mapHover != null) { mapHover = null; drawMap(); } });
   $("map-links").addEventListener("change", (e) => { mapAllLinks = e.target.checked; drawMap(); });
+  $("map-regions").addEventListener("change", (e) => { mapRegions = e.target.checked; drawMap(); });
   $("map-reset").addEventListener("click", () => { mapNeedsFit = true; render({ keepPage: true }); });
   window.addEventListener("resize", () => {
     if (state.view !== "graph" || !MAP) return;

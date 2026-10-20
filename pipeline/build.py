@@ -323,7 +323,8 @@ def main() -> None:
     (OUT_DIR / "favorites.json").write_text(json.dumps({"papers": extras}, ensure_ascii=False, separators=(",", ":")))
     if "embed" in only:
         embed.run(final + extras, embed.load_previous(args.previous), OUT_DIR, log)
-        layout.run(OUT_DIR, log)
+        layout.run(OUT_DIR, log, previous=fetch_json(args.previous, "map.json"),
+                   papers={p["id"]: p for p in final + extras}, name=ai.complete_json if "ai" in only else None)
     pending = (fetch_json(args.previous, "ai_pending.json") or {}).get("batches", [])
     if "ai" in only:
         pending = ai.run(final, pending, args.ai_wait, log, synced)
