@@ -1,11 +1,14 @@
 // biopapers — static client. Loads data/papers.json (+ older.json in the background, and
 // ml.json when the ML / CS section is opened), ranks and renders the feed.
-// Saves / upvotes / settings live in localStorage.
+// Saves / upvotes / settings live in localStorage, optionally synced to a secret GitHub Gist.
 
 "use strict";
 
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
+const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
+const SYNC_MAPS = ["votes", "saved", "hidden"];
+const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
 const DAY = 86400000;
 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).
@@ -36,7 +39,7 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {},
+  votes: {}, saved: {}, hidden: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(WEIGHTS).map(([k, w]) => [k, w.def])),
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
@@ -51,8 +54,21 @@ function loadState() {
 }
 
 let state = loadState();
-function persist() {
+let sync = (() => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch { return {}; } })();
+const syncStatus = { at: null, error: null, busy: false, again: false };
+let syncTimer = null, syncedJSON = null;
+
+const settingsJSON = (s) => JSON.stringify(SYNC_SETTINGS.map((k) => s[k]));
+let settingsSeen = settingsJSON(state);
+
+function saveLocal() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* private mode etc. */ }
+}
+function persist() {
+  const sj = settingsJSON(state);
+  if (sj !== settingsSeen) { state.settingsAt = Date.now(); settingsSeen = sj; }
+  saveLocal();
+  scheduleSync();
 }
 
 // Count a visit only if the last one was >1h ago, so reloads don't clear "new".
@@ -353,10 +369,10 @@ function card(p) {
 
 // ---- actions ---------------------------------------------------------------
 
-function toggle(map, p, value) {
-  const keys = [p.id, ...(p.aliases || [])].filter((k) => map[k]);
-  if (keys.length) keys.forEach((k) => delete map[k]);
-  else map[p.id] = value;
+function toggle(name, p, value) {
+  const keys = [p.id, ...(p.aliases || [])].filter((k) => state[name][k]);
+  if (keys.length) forget(name, keys);
+  else state[name][p.id] = value;
   return !keys.length;
 }
 
@@ -375,10 +391,10 @@ $("feed").addEventListener("click", (e) => {
   const p = byId.get(id) || state.saved[id]?.paper;
   if (!p) return;
   const act = btn.dataset.act;
-  if (act === "vote") toggle(state.votes, p, Date.now());
-  if (act === "save") toggle(state.saved, p, { ts: Date.now(), paper: snapshot(p) });
+  if (act === "vote") toggle("votes", p, Date.now());
+  if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
   if (act === "hide") {
-    if (curTab() === "saved") toggle(state.saved, p);
+    if (curTab() === "saved") toggle("saved", p);
     else state.hidden[p.id] = Date.now();
   }
   if (act !== "hide") affinityCache = null;
@@ -425,6 +441,7 @@ function renderSettings() {
       <output>${(+state.weights[k]).toFixed(1)}</output>
     </label>`).join("");
   $("halflife").value = String(state.halfLife);
+  renderSync();
 
   const tabs = allTabs();
   $("tabs-section").textContent = `— ${DATA.sections?.[state.section] || ""}`;
@@ -502,12 +519,163 @@ $("export-bib").addEventListener("click", () => {
   }).join("\n\n");
   download("biopapers-saved.bib", bib, "application/x-bibtex");
 });
-$("unhide").addEventListener("click", () => { state.hidden = {}; persist(); render(); });
+$("unhide").addEventListener("click", () => { forget("hidden", Object.keys(state.hidden)); persist(); render(); });
 $("reset").addEventListener("click", () => {
-  if (!confirm("Clear all saves, upvotes and settings in this browser?")) return;
-  state = { ...defaults(), lastVisit: state.lastVisit };
+  if (!confirm(`Clear all saves, upvotes and settings${sync.token ? " on every synced device" : " in this browser"}?`)) return;
+  for (const m of SYNC_MAPS) forget(m, Object.keys(state[m]));
+  state = { ...defaults(), removed: state.removed, lastVisit: state.lastVisit };
   persist(); affinityCache = null; renderSettings(); render();
 });
+
+// ---- sync (secret GitHub Gist) ---------------------------------------------------------
+// Votes / saves / hides merge per paper, newest wins. Un-doing one leaves a timestamped
+// tombstone in `removed` so other devices drop it too. Settings sync as one block, last
+// writer wins. Section, tab and sort choices stay per-device.
+
+const GIST_FILE = "biopapers-state.json";
+const TOMBSTONE_DAYS = 180;
+
+const entryTs = (v) => (typeof v === "number" ? v : v?.ts) || 0;
+const sortedObj = (o) => Object.fromEntries(Object.entries(o).sort(([a], [b]) => (a < b ? -1 : a > b)));
+const syncedPart = (s) => Object.fromEntries(["removed", "settingsAt", ...SYNC_MAPS, ...SYNC_SETTINGS].map((k) => [k, s[k]]));
+
+function forget(name, ids) {
+  const now = Date.now();
+  for (const id of ids) { delete state[name][id]; state.removed[`${name}:${id}`] = now; }
+}
+
+function mergeSynced(local, remote) {
+  const cutoff = Date.now() - TOMBSTONE_DAYS * DAY;
+  const removed = {};
+  for (const src of [local.removed, remote.removed])
+    for (const [k, t] of Object.entries(src || {})) if (t > cutoff) removed[k] = Math.max(removed[k] || 0, t);
+  const out = { removed: sortedObj(removed) };
+  for (const m of SYNC_MAPS) {
+    const merged = {};
+    for (const src of [local[m], remote[m]])
+      for (const [id, v] of Object.entries(src || {}))
+        if (entryTs(v) > (removed[`${m}:${id}`] || 0) && entryTs(v) >= entryTs(merged[id])) merged[id] = v;
+    out[m] = sortedObj(merged);
+  }
+  const newer = (remote.settingsAt || 0) > (local.settingsAt || 0) ? remote : local;
+  for (const k of SYNC_SETTINGS) out[k] = newer[k] ?? local[k];
+  out.settingsAt = newer.settingsAt || 0;
+  return out;
+}
+
+async function gh(path, { method = "GET", body } = {}) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method, cache: "no-store", body: body && JSON.stringify(body),
+    headers: { Authorization: `Bearer ${sync.token}`, Accept: "application/vnd.github+json" },
+  });
+  if (res.status === 401) throw new Error("GitHub rejected the token — paste a new one");
+  if (!res.ok) throw new Error(`GitHub ${res.status}`);
+  return res.json();
+}
+
+async function findGist() {
+  for (let page = 1; page <= 10; page++) {
+    const list = await gh(`/gists?per_page=100&page=${page}`);
+    const hit = list.find((g) => g.files[GIST_FILE]);
+    if (hit || list.length < 100) return hit?.id || null;
+  }
+  return null;
+}
+
+async function readGist() {
+  const f = (await gh(`/gists/${sync.gistId}`)).files[GIST_FILE];
+  if (!f) return {};
+  // The API inlines up to 1 MB; past that the content is only at raw_url.
+  const text = f.truncated ? await (await fetch(f.raw_url, { cache: "no-store" })).text() : f.content;
+  return JSON.parse(text || "{}");
+}
+
+function saveSyncConfig() {
+  try { sync.token ? localStorage.setItem(SYNC_KEY, JSON.stringify(sync)) : localStorage.removeItem(SYNC_KEY); } catch { /* */ }
+}
+
+function scheduleSync() {
+  if (!sync.token || JSON.stringify(syncedPart(state)) === syncedJSON) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncNow, 2000);
+}
+
+async function syncNow() {
+  if (!sync.token) return;
+  if (syncStatus.busy) { syncStatus.again = true; return; }
+  syncStatus.busy = true; clearTimeout(syncTimer);
+  try {
+    sync.gistId ||= await findGist();
+    const remote = sync.gistId ? await readGist() : {};
+    const before = JSON.stringify(syncedPart(state));
+    // Merge into the state as it is *now*, so clicks made while the request was in flight survive.
+    const merged = mergeSynced(syncedPart(state), remote);
+    const json = JSON.stringify(merged);
+    Object.assign(state, merged);
+    settingsSeen = settingsJSON(state);
+    saveLocal();
+    syncedJSON = JSON.stringify(syncedPart(state));
+    if (!sync.gistId) {
+      const g = await gh("/gists", { method: "POST", body: {
+        description: "biopapers sync — saves, upvotes and settings", public: false,
+        files: { [GIST_FILE]: { content: json } } } });
+      sync.gistId = g.id;
+    } else if (json !== JSON.stringify(remote)) {
+      await gh(`/gists/${sync.gistId}`, { method: "PATCH", body: { files: { [GIST_FILE]: { content: json } } } });
+    }
+    saveSyncConfig();
+    Object.assign(syncStatus, { at: Date.now(), error: null });
+    if (syncedJSON !== before) { affinityCache = null; if (DATA.generated) render({ keepPage: true }); }
+  } catch (err) {
+    syncStatus.error = err.message;
+    syncedJSON = null; // so the next change retries the push
+  } finally {
+    syncStatus.busy = false;
+    if (syncStatus.again) { syncStatus.again = false; scheduleSync(); }
+    if ($("settings").open) renderSync();
+  }
+}
+
+function renderSync() {
+  const err = syncStatus.error ? `<p class="hint sync-error">${esc(syncStatus.error)}</p>` : "";
+  if (!sync.token) {
+    $("sync-box").innerHTML = `
+      <p class="hint">Keep saves, upvotes, hides and ranking settings in a secret GitHub Gist so they follow
+        you to any browser. <a href="https://github.com/settings/tokens/new?scopes=gist&description=biopapers%20sync"
+        target="_blank" rel="noopener">Create a token</a> with only the <code>gist</code> scope and paste it here
+        on each device. The token stays in this browser.</p>
+      <div class="btnrow"><input type="password" id="sync-token" placeholder="ghp_…" autocomplete="off" aria-label="GitHub token">
+        <button type="button" data-sync="connect">Connect</button></div>${err}`;
+    return;
+  }
+  const when = syncStatus.busy ? "syncing…"
+    : syncStatus.at ? `last synced ${new Date(syncStatus.at).toLocaleTimeString([], { timeStyle: "short" })}` : "not synced yet";
+  const gist = sync.gistId ? `<a href="https://gist.github.com/${esc(sync.gistId)}" target="_blank" rel="noopener">secret gist</a>` : "secret gist";
+  $("sync-box").innerHTML = `
+    <p class="hint">Synced to your ${gist} · ${when}. Secret gists are unlisted, not private: anyone with the link can read it.</p>
+    <div class="btnrow"><button type="button" data-sync="now">Sync now</button>
+      <button type="button" data-sync="off">Disconnect</button></div>${err}`;
+}
+
+$("sync-box").addEventListener("click", async (e) => {
+  const act = e.target.closest("[data-sync]")?.dataset.sync;
+  if (act === "connect") {
+    const token = $("sync-token").value.trim();
+    if (!token) return;
+    sync = { token }; syncStatus.error = null; renderSync();
+    await syncNow();
+    if (syncStatus.error) { sync = {}; saveSyncConfig(); renderSync(); }
+    else renderSettings();
+  }
+  if (act === "now") syncNow().then(renderSync);
+  if (act === "off") { sync = {}; syncedJSON = null; Object.assign(syncStatus, { at: null, error: null }); saveSyncConfig(); renderSync(); }
+});
+
+// Pick up changes from other devices when you come back to the tab.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && sync.token && Date.now() - (syncStatus.at || 0) > 60000) syncNow();
+});
+if (sync.token) syncNow();
 
 load().catch((err) => {
   $("sub").textContent = "couldn't load papers";

@@ -11,7 +11,8 @@ Lowkey, alphaXiv-inspired paper feed for the Gilbert lab, in two sections:
 Saves, upvotes and ranking settings work across both.
 
 Static site — a daily GitHub Action fetches everything, writes JSON, and deploys to
-GitHub Pages. No server, no database. Your saves/upvotes/settings live in your browser.
+GitHub Pages. No server, no database. Your saves/upvotes/settings live in your browser, and can
+sync across devices through a secret GitHub Gist (⚙︎ → Sync across devices).
 
 ## How it works
 
@@ -86,8 +87,9 @@ committing data. Optional repo secrets/variables:
 
 ## Known limits
 
-- **Votes/saves are per-browser** (localStorage). Export JSON to back up or move devices.
-  Shared lab votes would need a small backend (e.g. Supabase) — see `CONSIDERATIONS.md`.
+- **Votes/saves** live in localStorage; turn on Gist sync to carry them across browsers (needs a
+  GitHub token with only the `gist` scope, pasted once per device). Shared lab votes would need a
+  small backend (e.g. Supabase) — see `CONSIDERATIONS.md`.
 - **No X/Twitter** — its API isn't free. Buzz uses HN + Bluesky + press coverage instead.
 - **Abstracts:** Nature/Science/Cell RSS give short summaries; we backfill from OpenAlex,
   which often has no abstract for Elsevier/Springer papers.
