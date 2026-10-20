@@ -26,6 +26,8 @@ python -m pipeline.build                          site/index.html + app.js
                     niche-topic literature search)
   buzz:   Hacker News · Bluesky · ScienceDaily
   merge with yesterday's data → dedup → tag
+  embed (bge-small, local) → UMAP map + nearest neighbours
+  AI score + TL;DR per paper (Claude Haiku 5.5, batch API)
   → site/data/papers.json, older.json, ml.json ─▶  site/alerts.xml (RSS of PI + buzz hits)
   → archive/papers-YYYY-MM.jsonl.gz ─▶ "archive" GitHub release (permanent, never pruned)
 ```
@@ -52,10 +54,24 @@ All in `config/` — edit, push, and the next build picks it up (and re-tags eve
 | `config/topics.yaml` | Sections + interest tabs: keywords, journals, preprint categories, OpenAlex searches |
 | `config/people.yaml` | PI watchlist (Uhler, Hacohen, Spranger) — name + OpenAlex ID |
 | `config/sources.yaml` | Journal RSS feeds, OpenAlex-by-ISSN journals, ML arXiv categories + HF, buzz sources |
+| `config/profile.md` | Who the AI scorer is reading for — plain prose; edit it to change what counts as a must-read |
 
 In the site itself (⚙︎): ranking weights for **For You** (recency, buzz, PIs, similarity to
 what you save/upvote, your upvotes), recency half-life, tab order/visibility, per-topic weights,
 export/import of your data, saved → BibTeX.
+
+## AI scores, embeddings and the map
+
+- **Must read** — every paper gets a 0–10 relevance score, a one-line TL;DR and a few words on
+  why it matters, from Claude Haiku 5.5 reading the title + abstract against `config/profile.md`
+  (plus your saved / upvoted papers, if `BIOPAPERS_GIST_ID` is set). Papers scoring ≥ 7 land in the
+  Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Runs through
+  the Message Batches API at half price — about $2/month. A batch that isn't done after 20 minutes is
+  collected by the next day's build.
+- **Embeddings** — bge-small-en-v1.5 over title + abstract, computed on the Actions runner (free).
+  They power "Similar to what I save / upvote" in For You and the **similar papers** button.
+- **Map** — a UMAP layout of the embeddings, colored by topic. ♥ marks what you saved or upvoted,
+  with lines to their nearest neighbours; click any dot to see it and the 20 papers most like it.
 
 ## Run locally
 
@@ -64,7 +80,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python -m pipeline.build --days 30          # first run / backfill (~10–15 min)
 .venv/bin/python -m pipeline.build                    # daily incremental (last 3 days, merged)
-.venv/bin/python -m pipeline.build --only rss,buzz    # quick run with a subset of sources
+.venv/bin/python -m pipeline.build --only rss,buzz    # quick run with a subset of sources (skips embed + ai)
 
 python3 -m http.server -d site 8000                   # open http://127.0.0.1:8000
 ```
@@ -84,6 +100,8 @@ committing data. Optional repo secrets/variables:
 | `BSKY_HANDLE`, `BSKY_APP_PASSWORD` | secrets | Authenticated Bluesky search — much better buzz coverage than anonymous ([make an app password](https://bsky.app/settings/app-passwords)) |
 | `OPENALEX_MAILTO` | variable | Contact email for OpenAlex's polite pool |
 | `OPENALEX_API_KEY` | secret | If OpenAlex rate-limits anonymous use |
+| `ANTHROPIC_API_KEY` | secret | AI scores + TL;DRs (skipped without it; everything else still runs) |
+| `BIOPAPERS_GIST_ID` | variable | Your sync gist's ID (from ⚙︎ → Sync) — lets the scorer learn from what you save |
 
 ## Known limits
 

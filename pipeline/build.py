@@ -10,6 +10,9 @@ Outputs:
     site/data/papers.json   last 10 days + tab/PI config (the site loads this first)
     site/data/older.json    the rest of the window (loaded in the background)
     site/data/ml.json       ML-only papers for the ML / CS section (loaded when you open it)
+    site/data/vectors.*     int8 title+abstract embeddings for every paper above (see embed.py)
+    site/data/map.json      2D UMAP layout + nearest-neighbour graph of those (see layout.py)
+    site/data/ai_pending.json   AI-scoring batches still running, collected next build (see ai.py)
     site/alerts.xml         RSS feed of PI-watchlist + buzzing papers (subscribe for alerts)
     archive/papers-YYYY-MM.jsonl.gz   every paper seen, untruncated and never pruned (see archive.py)
 """
@@ -22,14 +25,15 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .common import ROOT, client, load_config, strip_label, title_key, today
-from . import archive
+from . import ai, archive, embed, layout
 from .sources import buzz, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
 OUT_DIR = ROOT / "site" / "data"
 RECENT_DAYS = 10  # papers.json = last 10 days (loads first); older.json = the rest
 ALERTS_PATH = ROOT / "site" / "alerts.xml"
-ALL_SOURCES = ["biorxiv", "medrxiv", "arxiv", "rss", "openalex", "search", "pis", "ml", "hf", "buzz"]
+ALL_SOURCES = ["biorxiv", "medrxiv", "arxiv", "rss", "openalex", "search", "pis", "ml", "hf", "buzz",
+               "embed", "ai"]  # the last two are enrichment steps, not sources
 BUZZ_ALERT_SCORE = 5       # bio: e.g. 100 HN points, 5 Bluesky posts, or 2 press stories
 BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~300 HF upvotes — HF votes are plentiful, so a higher bar
 MAX_AUTHORS = 13  # keep first 10 + last 3 (PIs are usually last)
@@ -42,24 +46,27 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def fetch_json(base: str | None, name: str) -> dict | None:
+    """One file from the last build: `base` is the data dir, local or the live site's URL."""
+    src = f"{base.rstrip('/')}/{name}" if base else ""
+    try:
+        if src.startswith("http"):
+            with client() as c:
+                resp = c.get(src)
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                return resp.json()
+        if src and Path(src).exists():
+            return json.loads(Path(src).read_text())
+    except Exception as ex:
+        log(f"! couldn't load previous data from {src}: {ex}")
+    return None
+
+
 def load_previous(base: str | None) -> list[dict]:
-    """Papers from the last build: `base` is the data dir, local or the live site's URL."""
-    papers = []
-    for name in ("papers.json", "older.json", "ml.json"):
-        src = f"{base.rstrip('/')}/{name}" if base else ""
-        try:
-            if src.startswith("http"):
-                with client() as c:
-                    resp = c.get(src)
-                    if resp.status_code == 404:
-                        continue
-                    resp.raise_for_status()
-                    papers += resp.json().get("papers", [])
-            elif src and Path(src).exists():
-                papers += json.loads(Path(src).read_text()).get("papers", [])
-        except Exception as ex:
-            log(f"! couldn't load previous data from {src}: {ex}")
-    return papers
+    return [p for name in ("papers.json", "older.json", "ml.json")
+            for p in (fetch_json(base, name) or {}).get("papers", [])]
 
 
 def timed(label: str, fn, *args) -> list | dict:
@@ -279,6 +286,7 @@ def main() -> None:
     ap.add_argument("--previous", default=str(OUT_DIR), help="data dir (path or URL) of the last build")
     ap.add_argument("--only", default=",".join(ALL_SOURCES), help=f"subset of {ALL_SOURCES}")
     ap.add_argument("--site-url", default="", help="public site URL (for alerts.xml)")
+    ap.add_argument("--ai-wait", type=float, default=20, help="minutes to wait for the AI-scoring batch")
     args = ap.parse_args()
 
     topics_file = load_config("topics")
@@ -291,7 +299,8 @@ def main() -> None:
     days = args.days if previous else max(args.days, args.backfill_days)
     log(f"previous: {len(previous)} papers · fetching last {days} days")
 
-    fresh, signals = fetch_everything(days, args.keep_days, set(args.only.split(",")), tagger)
+    only = set(args.only.split(","))
+    fresh, signals = fetch_everything(days, args.keep_days, only, tagger)
     papers = merge(previous, fresh)
     enrich(papers, signals)
     apply_buzz(papers, signals)
@@ -299,6 +308,16 @@ def main() -> None:
     final = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if "embed" in only:
+        embed.run(final, embed.load_previous(args.previous), OUT_DIR, log)
+        layout.run(OUT_DIR, log)
+    pending = (fetch_json(args.previous, "ai_pending.json") or {}).get("batches", [])
+    if "ai" in only:
+        pending = ai.run(final, pending, args.ai_wait, log)
+        for p in final:  # final holds trimmed copies; the archive reads `papers`
+            if "ai" in p:
+                papers[p["id"]]["ai"] = p["ai"]
+    (OUT_DIR / "ai_pending.json").write_text(json.dumps({"batches": pending}))
     recent_cut = (today() - dt.timedelta(days=RECENT_DAYS)).isoformat()
     bio = [p for p in final if "bio" in p["sections"]]
     recent = [p for p in bio if p["date"] >= recent_cut]

@@ -1,5 +1,6 @@
-// biopapers — static client. Loads data/papers.json (+ older.json in the background, and
-// ml.json when the ML / CS section is opened), ranks and renders the feed.
+// biopapers — static client. Loads data/papers.json (+ older.json and the embeddings in the
+// background, ml.json when the ML / CS section is opened, map.json for the Map tab), ranks and
+// renders the feed.
 // Saves / upvotes / settings live in localStorage, optionally synced to a secret GitHub Gist.
 
 "use strict";
@@ -10,10 +11,13 @@ const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export
 const SYNC_MAPS = ["votes", "saved", "hidden"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
 const DAY = 86400000;
+const MUST_READ = 7; // AI score (0–10) at which a paper lands in "Must read"
 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).
 const SPECIAL_TABS = {
   foryou: { label: "For You", color: "var(--ink)" },
+  mustread: { label: "Must read", color: "#e6b422" },
+  map: { label: "Map", color: "#8fa8d6" },
   pis: { label: "PI Watch", color: "#a98fd6" },
   buzz: { label: "Buzz", color: "var(--hot)" },
   mlforyou: { label: "For You", color: "var(--ink)" },
@@ -21,13 +25,14 @@ const SPECIAL_TABS = {
   saved: { label: "Saved", color: "#f2b15c" },
 };
 const SECTION_TABS = {
-  bio: { head: ["foryou"], tail: ["pis", "buzz", "saved"] },
-  ml: { head: ["mlforyou", "trending"], tail: ["saved"] },
+  bio: { head: ["foryou", "mustread"], tail: ["pis", "buzz", "saved", "map"] },
+  ml: { head: ["mlforyou", "mustread", "trending"], tail: ["saved", "map"] },
 };
 const HOT_TABS = new Set(["buzz", "trending"]);
 
 const WEIGHTS = {
   recency: { label: "Recency", def: 1 },
+  ai: { label: "AI relevance (Claude's 0–10 score for you)", def: 1 },
   buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
   pi: { label: "Watched PIs", def: 1 },
   affinity: { label: "Similar to what I save / upvote", def: 0.8 },
@@ -49,7 +54,9 @@ const defaults = () => ({
 function loadState() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    return raw ? { ...defaults(), ...JSON.parse(raw) } : defaults();
+    if (!raw) return defaults();
+    const saved = JSON.parse(raw), d = defaults();
+    return { ...d, ...saved, weights: { ...d.weights, ...saved.weights } }; // new weights get their default
   } catch { return defaults(); }
 }
 
@@ -88,6 +95,8 @@ let DATA = { sections: {}, topics: [], people: [], papers: [], generated: null }
 let byId = new Map();
 let topicSection = new Map();
 let mlLoaded = null; // promise once ml.json is requested
+let VEC = null; // { dim, data: Int8Array, norms, index: Map(id -> row) } once vectors load
+let MAP = null, mapLoaded = null; // { ids, xy, nn, index } once map.json loads
 
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
@@ -127,6 +136,54 @@ async function load() {
   if (state.section === "ml") await loadML();
   addPapers(await fetchPapers("older.json"));
   render({ keepPage: true });
+  loadVectors();
+}
+
+async function loadVectors() {
+  try {
+    const [meta, buf] = await Promise.all([
+      fetch("data/vectors.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)),
+      fetch("data/vectors.bin", { cache: "no-cache" }).then((r) => (r.ok ? r.arrayBuffer() : null)),
+    ]);
+    if (!meta || !buf) return;
+    const data = new Int8Array(buf), dim = meta.dim, n = meta.ids.length;
+    if (data.length !== n * dim) return;
+    const norms = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let s = 0; for (let j = i * dim; j < (i + 1) * dim; j++) s += data[j] * data[j];
+      norms[i] = Math.sqrt(s) || 1;
+    }
+    VEC = { dim, data, norms, index: new Map(meta.ids.map((id, i) => [id, i])) };
+    affinityCache = null;
+    render({ keepPage: true });
+  } catch { /* no embeddings yet: TF-IDF fallback */ }
+}
+
+function loadMap() {
+  mapLoaded ||= fetch("data/map.json", { cache: "no-cache" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((m) => { if (m) MAP = { ...m, index: new Map(m.ids.map((id, i) => [id, i])) }; })
+    .catch(() => {})
+    .finally(() => { if (curTab() === "map") render({ keepPage: true }); });
+  return mapLoaded;
+}
+
+const vecRow = (p) => [p.id, ...(p.aliases || [])].map((k) => VEC.index.get(k)).find((i) => i !== undefined);
+
+// Papers most like `p`, by embedding cosine (or the map's neighbour lists before vectors load).
+function similarTo(p, n = 20) {
+  const r = VEC && vecRow(p);
+  if (r === undefined || !VEC) {
+    const i = MAP?.index.get(p.id);
+    return i === undefined ? [] : MAP.nn[i].map((j) => byId.get(MAP.ids[j])).filter(Boolean);
+  }
+  const { dim, data, norms } = VEC, base = r * dim, out = [];
+  for (const [id, i] of VEC.index) {
+    if (i === r || !byId.has(id)) continue;
+    let dot = 0; for (let j = 0; j < dim; j++) dot += data[base + j] * data[i * dim + j];
+    out.push([dot / (norms[r] * norms[i]), id]);
+  }
+  return out.sort((a, b) => b[0] - a[0]).slice(0, n).map(([, id]) => byId.get(id));
 }
 
 // ---- ranking ---------------------------------------------------------------
@@ -153,6 +210,7 @@ function affinityScores() {
   const liked = new Set([...Object.keys(state.saved), ...Object.keys(state.votes)]);
   affinityCache = new Map();
   if (!liked.size) return affinityCache;
+  if (VEC && embeddingAffinity(liked)) return affinityCache;
 
   const docs = DATA.papers.map((p) => [p.id, tokens(p)]);
   const df = new Map();
@@ -185,6 +243,32 @@ function affinityScores() {
   return affinityCache;
 }
 
+// Cosine to the mean of liked papers' embeddings, stretched so the median paper scores 0 and the
+// closest scores 1 (raw cosines bunch up between ~0.6 and 0.9). False if no liked paper has a vector.
+function embeddingAffinity(liked) {
+  const { dim, data, norms } = VEC, prof = new Float32Array(dim);
+  let any = false;
+  for (const id of liked) {
+    const r = VEC.index.get(id);
+    if (r === undefined) continue;
+    any = true;
+    for (let j = 0; j < dim; j++) prof[j] += data[r * dim + j] / norms[r];
+  }
+  if (!any) return false;
+  let pn = 0; for (const x of prof) pn += x * x; pn = Math.sqrt(pn) || 1;
+  const sims = [];
+  for (const p of DATA.papers) {
+    const r = vecRow(p);
+    if (r === undefined) continue;
+    let dot = 0; for (let j = 0; j < dim; j++) dot += prof[j] * data[r * dim + j];
+    sims.push([p.id, dot / (pn * norms[r])]);
+  }
+  const sorted = sims.map(([, s]) => s).sort((a, b) => a - b);
+  const lo = sorted[Math.floor(sorted.length / 2)] ?? 0, hi = sorted[sorted.length - 1] ?? 1;
+  for (const [id, s] of sims) affinityCache.set(id, Math.max(0, (s - lo) / ((hi - lo) || 1)));
+  return true;
+}
+
 const sectionTopics = (p) => (p.topics || []).filter((t) => topicSection.get(t) === state.section);
 
 function topicWeight(p) {
@@ -200,7 +284,8 @@ function score(p, aff, now) {
   const buzz = Math.min(1, Math.log1p(p.buzz_score || 0) / Math.log1p(20));
   const pi = p.pis?.length ? 1 : 0;
   const vote = has(state.votes, p) || has(state.saved, p) ? 1 : 0;
-  return topicWeight(p) * (w.recency * recency + w.buzz * buzz + w.pi * pi
+  const ai = (p.ai?.score ?? 3) / 10; // unscored papers count as a middling 3
+  return topicWeight(p) * (w.recency * recency + w.ai * ai + w.buzz * buzz + w.pi * pi
     + w.affinity * (aff.get(p.id) || 0) + w.vote * vote);
 }
 
@@ -223,6 +308,8 @@ function inTab(p, tab) {
   if (tab === "foryou") return (sectionTopics(p).length || p.pis?.length) && topicWeight(p) > 0;
   if (tab === "mlforyou") return topicWeight(p) > 0;
   if (tab === "pis") return p.pis?.length > 0;
+  if (tab === "mustread") return (p.ai?.score ?? 0) >= MUST_READ && topicWeight(p) > 0;
+  if (tab === "map") return !!MAP?.index.has(p.id);
   if (HOT_TABS.has(tab)) return (p.buzz_score || 0) > 0;
   return p.topics?.includes(tab);
 }
@@ -291,6 +378,7 @@ function render({ keepPage = false } = {}) {
   const sort = sortFor(tab);
   const sortLabel = (k, label) => k === "buzz" && state.section === "ml" ? "Hot" : label;
   $("sortbar").innerHTML = tab === "saved" ? `<button class="active">Recently saved</button>`
+    : tab === "map" ? ""
     : Object.entries(SORTS).map(([k, label]) =>
         `<button data-sort="${k}" class="${k === sort ? "active" : ""}">${sortLabel(k, label)}</button>`).join("");
 
@@ -302,6 +390,9 @@ function render({ keepPage = false } = {}) {
         `<button class="chip ${ui.pi === name ? "active" : ""}" data-pi="${esc(name ?? "")}"
           title="${esc(DATA.people.find((x) => x.name === name)?.note || "")}">${esc(name ?? "All PIs")}</button>`).join("")
     : "";
+
+  $("mapview").hidden = tab !== "map";
+  if (tab === "map") { renderMap(); return; }
 
   const list = visiblePapers();
   $("feed").innerHTML = list.length
@@ -356,13 +447,14 @@ function card(p) {
         ${hf.org ? `<span class="badge org">${esc(hf.org)}</span>` : ""}
         <span class="date">${esc(p.date)}</span>
         ${(p.pis || []).map((n) => `<span class="badge pi">PI · ${esc(n)}</span>`).join("")}
+        ${p.ai ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
         ${hot}
         ${topics.map((t) => `<span class="badge" style="--c:${t.color}">${esc(t.label)}</span>`).join("")}
       </div>
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
-      ${hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(hf.tldr)}</div>` : ""}
+      ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
       ${p.abstract ? `<div class="abstract">${esc(p.abstract)}</div>` : ""}
-      ${links.length ? `<div class="links">${links.join("")}</div>` : ""}
+      <div class="links">${links.join("")}<button type="button" class="linkbtn" data-act="map" title="Show on the map with its nearest neighbours">similar papers</button></div>
     </div>
   </article>`;
 }
@@ -391,6 +483,7 @@ $("feed").addEventListener("click", (e) => {
   const p = byId.get(id) || state.saved[id]?.paper;
   if (!p) return;
   const act = btn.dataset.act;
+  if (act === "map") { showOnMap(p); return; }
   if (act === "vote") toggle("votes", p, Date.now());
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
   if (act === "hide") {
@@ -431,6 +524,191 @@ $("search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => { ui.query = e.target.value.trim(); render(); }, 150);
 });
+
+// ---- map ---------------------------------------------------------------------------
+// UMAP layout of the embeddings (built by pipeline/layout.py). Dots take their topic's color;
+// ♥ marks papers you saved or upvoted, with lines to their nearest neighbours. Click a dot to
+// see that paper and the ones most like it below the map.
+
+const mapView = { k: 1, tx: 0, ty: 0 };
+let mapSel = null, mapHover = null, mapFocus = null, mapPts = [], mapSize = { w: 0, h: 0, s: 0 };
+let mapAllLinks = false;
+
+function showOnMap(p) {
+  mapFocus = p.id;
+  setTab("map"); persist(); render();
+  window.scrollTo({ top: 0 });
+}
+
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const isLiked = (p) => has(state.saved, p) || has(state.votes, p);
+
+function matchesFilters(p) {
+  if (ui.newOnly && !isNew(p)) return false;
+  if (!ui.query) return true;
+  return `${p.title} ${p.authors.join(" ")} ${p.abstract} ${p.venue}`.toLowerCase().includes(ui.query.toLowerCase());
+}
+
+function sizeMap() {
+  const c = $("map"), w = c.parentElement.clientWidth, h = Math.min(Math.round(window.innerHeight * 0.68), 680);
+  const dpr = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) {
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    c.style.width = `${w}px`; c.style.height = `${h}px`;
+  }
+  mapSize = { w, h, s: Math.min(w, h) * 0.92, dpr };
+}
+
+// Layout coords (0..1) -> CSS pixels, before and after pan/zoom.
+const mapBase = (i) => [(mapSize.w - mapSize.s) / 2 + MAP.xy[i][0] * mapSize.s, (mapSize.h - mapSize.s) / 2 + MAP.xy[i][1] * mapSize.s];
+const mapScreen = (i) => { const [x, y] = mapBase(i); return [x * mapView.k + mapView.tx, y * mapView.k + mapView.ty]; };
+
+function renderMap() {
+  $("more").hidden = true;
+  if (!MAP) {
+    $("feed").innerHTML = `<div class="empty">${mapLoaded ? "No map yet. It's built by the next daily run." : "Loading the map…"}</div>`;
+    loadMap();
+    return;
+  }
+  sizeMap();
+  if (mapFocus) {
+    const i = MAP.index.get(mapFocus);
+    if (i !== undefined) {
+      mapSel = i;
+      mapView.k = Math.max(mapView.k, 3);
+      const [x, y] = mapBase(i);
+      mapView.tx = mapSize.w / 2 - x * mapView.k; mapView.ty = mapSize.h / 2 - y * mapView.k;
+    }
+    mapFocus = null;
+  }
+  const muted = cssVar("--muted");
+  mapPts = [];
+  MAP.ids.forEach((id, i) => {
+    const p = byId.get(id);
+    if (!p || !(p.sections || ["bio"]).includes(state.section) || has(state.hidden, p)) return;
+    const topic = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t))
+      .find((t) => t && (t.section || "bio") === state.section);
+    mapPts.push({ i, p, color: topic?.color || (p.pis?.length ? "#a98fd6" : muted), liked: isLiked(p), dim: !matchesFilters(p) });
+  });
+  drawMap();
+
+  const sel = mapSel != null ? byId.get(MAP.ids[mapSel]) : null;
+  $("feed").innerHTML = sel
+    ? card(sel) + `<h4 class="map-h">Most similar</h4>` + similarTo(sel).map(card).join("")
+    : `<div class="empty">Click a dot to see the paper and the papers most like it.</div>`;
+}
+
+function drawMap() {
+  const c = $("map"), ctx = c.getContext("2d"), { w, h, dpr } = mapSize;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const ink = cssVar("--ink"), hot = cssVar("--hot");
+  const onMap = new Set(mapPts.map((q) => q.i));
+  const line = (i, j, alpha, color = ink, width = 1) => {
+    if (!onMap.has(j)) return;
+    const [x1, y1] = mapScreen(i), [x2, y2] = mapScreen(j);
+    ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = width;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  };
+  for (const q of mapPts) {
+    if (mapAllLinks) for (const j of MAP.nn[q.i].slice(0, 4)) line(q.i, j, 0.05);
+    else if (q.liked) for (const j of MAP.nn[q.i].slice(0, 5)) line(q.i, j, 0.35, hot);
+  }
+  if (mapSel != null && onMap.has(mapSel)) for (const j of MAP.nn[mapSel]) line(mapSel, j, 0.85, ink, 1.5);
+
+  const r = Math.min(4, 2 + Math.log2(mapView.k));
+  for (const q of mapPts) {
+    if (q.liked) continue;
+    const [x, y] = mapScreen(q.i);
+    if (x < -5 || y < -5 || x > w + 5 || y > h + 5) continue;
+    ctx.globalAlpha = q.dim ? 0.08 : 0.75; ctx.fillStyle = q.color;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
+  }
+  ctx.font = "15px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const q of mapPts) {
+    if (!q.liked) continue;
+    const [x, y] = mapScreen(q.i);
+    ctx.globalAlpha = q.dim ? 0.25 : 1; ctx.fillStyle = hot; ctx.fillText("♥", x, y);
+  }
+  for (const [i, ring] of [[mapHover, 7], [mapSel, 9]]) {
+    if (i == null || !onMap.has(i)) continue;
+    const [x, y] = mapScreen(i);
+    ctx.globalAlpha = 1; ctx.strokeStyle = ink; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, ring, 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function mapHit(x, y) {
+  let best = null, bestD = 10 * 10;
+  for (const q of mapPts) {
+    const [px, py] = mapScreen(q.i), d = (px - x) ** 2 + (py - y) ** 2;
+    if (d < bestD) { bestD = d; best = q; }
+  }
+  return best;
+}
+
+(function wireMap() {
+  const c = $("map"), tip = $("map-tip"), pointers = new Map();
+  let drag = null, pinch = null;
+  const pos = (e) => { const b = c.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; };
+  const zoomAt = (x, y, f) => {
+    const k = Math.min(40, Math.max(0.5, mapView.k * f)); f = k / mapView.k;
+    mapView.tx = x - (x - mapView.tx) * f; mapView.ty = y - (y - mapView.ty) * f; mapView.k = k;
+    drawMap();
+  };
+  c.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const [x, y] = pos(e); zoomAt(x, y, Math.exp(-e.deltaY * 0.0015));
+  }, { passive: false });
+  c.addEventListener("pointerdown", (e) => {
+    c.setPointerCapture(e.pointerId); pointers.set(e.pointerId, pos(e));
+    if (pointers.size === 1) drag = { start: pos(e), last: pos(e), moved: false };
+    if (pointers.size === 2) { const [a, b] = [...pointers.values()]; pinch = Math.hypot(a[0] - b[0], a[1] - b[1]); drag = null; }
+  });
+  c.addEventListener("pointermove", (e) => {
+    const [x, y] = pos(e);
+    if (pointers.has(e.pointerId)) pointers.set(e.pointerId, [x, y]);
+    if (pinch && pointers.size === 2) {
+      const [a, b] = [...pointers.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      zoomAt((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, d / pinch); pinch = d; return;
+    }
+    if (drag) {
+      if (Math.hypot(x - drag.start[0], y - drag.start[1]) > 4) drag.moved = true;
+      if (drag.moved) { mapView.tx += x - drag.last[0]; mapView.ty += y - drag.last[1]; drag.last = [x, y]; tip.hidden = true; drawMap(); return; }
+    }
+    if (e.pointerType !== "mouse") return;
+    const q = mapHit(x, y), i = q?.i ?? null;
+    if (i !== mapHover) { mapHover = i; drawMap(); }
+    tip.hidden = !q;
+    if (q) {
+      tip.textContent = q.p.title;
+      tip.style.left = `${Math.min(x + 14, mapSize.w - 260)}px`; tip.style.top = `${y + 14}px`;
+    }
+  });
+  const end = (e) => {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (drag && !drag.moved && pointers.size === 0) {
+      const q = mapHit(...pos(e));
+      mapSel = q ? q.i : null;
+      render({ keepPage: true });
+    }
+    if (pointers.size === 0) drag = null;
+  };
+  c.addEventListener("pointerup", end);
+  c.addEventListener("pointercancel", (e) => { pointers.delete(e.pointerId); drag = null; pinch = null; });
+  c.addEventListener("pointerleave", () => { tip.hidden = true; if (mapHover != null) { mapHover = null; drawMap(); } });
+  $("map-links").addEventListener("change", (e) => { mapAllLinks = e.target.checked; drawMap(); });
+  $("map-reset").addEventListener("click", () => { Object.assign(mapView, { k: 1, tx: 0, ty: 0 }); drawMap(); });
+  window.addEventListener("resize", () => {
+    if (curTab() !== "map" || !MAP) return;
+    // The old pan/zoom is meaningless at the new size: re-centre on the selection, or reset.
+    if (mapSel != null) mapFocus = MAP.ids[mapSel];
+    else Object.assign(mapView, { k: 1, tx: 0, ty: 0 });
+    renderMap();
+  });
+})();
 
 // ---- settings ---------------------------------------------------------------
 

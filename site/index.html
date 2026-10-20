@@ -34,6 +34,17 @@
   </div>
 
   <div class="wrap">
+    <section id="mapview" class="mapview" hidden>
+      <div class="map-wrap">
+        <canvas id="map" aria-label="Map of papers by similarity"></canvas>
+        <div id="map-tip" class="map-tip" hidden></div>
+      </div>
+      <div class="map-bar">
+        <span><span class="heart">♥</span> saved or upvoted · scroll or pinch to zoom, drag to pan · search dims what doesn't match</span>
+        <label><input type="checkbox" id="map-links"> all links</label>
+        <button type="button" id="map-reset">reset view</button>
+      </div>
+    </section>
     <main id="feed" aria-live="polite"></main>
     <div class="more"><button id="more" hidden>Show more</button></div>
   </div>

@@ -7,3 +7,4 @@ site/data/
 site/alerts.xml
 .claude/settings.local.json
 archive/
+.cache/
