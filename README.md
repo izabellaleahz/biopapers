@@ -65,9 +65,9 @@ export/import of your data, saved → BibTeX.
 - **Must read** — every paper gets a 0–10 relevance score, a one-line TL;DR and a few words on
   why it matters, from Claude Haiku 5.5 reading the title + abstract against `config/profile.md`
   (plus your saved / upvoted papers, if `BIOPAPERS_GIST_ID` is set). Papers scoring ≥ 7 land in the
-  Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Runs through
-  the Message Batches API at half price — about $2/month. A batch that isn't done after 20 minutes is
-  collected by the next day's build.
+  Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Uses
+  `ANTHROPIC_API_KEY` (Message Batches API, half price, ~$2/month) or else `OPENROUTER_API_KEY`
+  (`anthropic/claude-haiku-5.5`, direct calls, ~$3–4/month, at most 3,000 papers per build).
 - **Embeddings** — bge-small-en-v1.5 over title + abstract, computed on the Actions runner (free).
   They power "Similar to what I save / upvote" in For You and the **similar papers** button.
 - **Graph** — its own view next to Bio | ML / CS: a UMAP layout of the embeddings, colored by topic.
@@ -77,8 +77,10 @@ export/import of your data, saved → BibTeX.
   Graph's search box (your feed, or the whole literature via OpenAlex, by title / DOI / arXiv ID).
   They sync through the gist, never age out, steer For You and the AI scorer, and give each label its
   own group in the **♥ Near favorites** tab, which works like a topic defined by example papers.
-  Favorites from outside the feed join the graph on the next daily build (needs Gist sync +
-  `BIOPAPERS_GIST_ID`); they're published in `data/favorites.json` like the rest of the site's data.
+  A favorite from outside the feed is embedded right in the browser (same model, via transformers.js —
+  a one-time 34 MB download) and placed next to its nearest papers immediately. With Gist sync +
+  `BIOPAPERS_GIST_ID` the daily build also picks favorites up (for the AI scorer and other devices);
+  those are published in `data/favorites.json` like the rest of the site's data.
 
 ## Run locally
 
@@ -107,7 +109,8 @@ committing data. Optional repo secrets/variables:
 | `BSKY_HANDLE`, `BSKY_APP_PASSWORD` | secrets | Authenticated Bluesky search — much better buzz coverage than anonymous ([make an app password](https://bsky.app/settings/app-passwords)) |
 | `OPENALEX_MAILTO` | variable | Contact email for OpenAlex's polite pool |
 | `OPENALEX_API_KEY` | secret | If OpenAlex rate-limits anonymous use |
-| `ANTHROPIC_API_KEY` | secret | AI scores + TL;DRs (skipped without it; everything else still runs) |
+| `ANTHROPIC_API_KEY` | secret | AI scores + TL;DRs via Anthropic (batch, cheapest) |
+| `OPENROUTER_API_KEY` | secret | …or via OpenRouter, if there's no Anthropic key (neither: scoring is skipped) |
 | `BIOPAPERS_GIST_ID` | variable | Your sync gist's ID (from ⚙︎ → Sync) — lets the scorer learn from what you save |
 
 ## Known limits

@@ -56,6 +56,7 @@ jobs:
           OPENALEX_MAILTO: ${{ vars.OPENALEX_MAILTO }}
           OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           BIOPAPERS_GIST_ID: ${{ vars.BIOPAPERS_GIST_ID }}
         run: |
           python -m pipeline.build \

@@ -158,6 +158,8 @@ async function loadVectors() {
     VEC = { dim, data, norms, index: new Map(meta.ids.map((id, i) => [id, i])) };
     affinityCache = nearCache = null;
     render({ keepPage: true });
+    // Favorites the build hasn't embedded need the map loaded to be placed (Near favorites uses them too).
+    if (Object.keys(state.favorites).some((id) => !VEC.index.has(id))) loadMap();
   } catch { /* no embeddings yet: TF-IDF fallback */ }
 }
 
@@ -170,7 +172,7 @@ function loadMap() {
     fetch("data/map.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
     favsLoaded,
   ]).then(([m]) => { if (m) MAP = { ...m, index: new Map(m.ids.map((id, i) => [id, i])) }; })
-    .finally(() => { mapNeedsFit = true; render({ keepPage: true }); });
+    .finally(() => { mapNeedsFit = true; render({ keepPage: true }); placeFavorites(); });
   return mapLoaded;
 }
 
@@ -528,6 +530,7 @@ function toggleFavorite(p) {
   toggle("favorites", p, { ts: Date.now(), paper: snapshot(p, 1500) });
   affinityCache = nearCache = null;
   mapNeedsFit = true;
+  placeFavorites();
 }
 
 $("feed").addEventListener("click", (e) => {
@@ -600,6 +603,7 @@ $("search").addEventListener("input", (e) => {
 const mapView = { k: 1, tx: 0, ty: 0 };
 let mapSel = null, mapHover = null, mapFocus = null, mapPts = [], mapSize = { w: 0, h: 0, s: 0 };
 let mapAllLinks = false, mapNeedsFit = true, lookupResults = [];
+let placeStatus = null, placing = null, extractor = null; // in-browser embedding of new favorites
 
 function showOnMap(p) {
   mapFocus = p.id;
@@ -663,6 +667,7 @@ function renderGraph() {
     const p = byId.get(id);
     if (!p || has(state.hidden, p)) return;
     const fav = favIdx.has(i);
+    if (p.favorite_only && !fav) return; // a favorite you've since removed
     if (!fav && state.graphSection !== "all" && !(p.sections || ["bio"]).includes(state.graphSection)) return;
     if (around && !fav && !near.has(id)) return;
     const topic = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t)).find(Boolean);
@@ -752,14 +757,83 @@ function mapHit(x, y) {
   return best;
 }
 
+// ---- placing new favorites (in-browser embeddings) ----
+// A favorite the build hasn't embedded (looked up from the literature, or ♥'d since the last build)
+// is embedded right here with the same model the build uses (bge-small-en-v1.5 via transformers.js;
+// ~34 MB, downloaded once and cached by the browser) and dropped onto the graph near its 8 most
+// similar papers. Its vector is kept in this browser, so it stays put across reloads.
+
+const TJS_URL = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/dist/transformers.min.js";
+const FAVVEC_KEY = "biopapers:favvec";
+const loadFavVecs = () => { try { return JSON.parse(localStorage.getItem(FAVVEC_KEY)) || {}; } catch { return {}; } };
+const saveFavVecs = (m) => { try { localStorage.setItem(FAVVEC_KEY, JSON.stringify(m)); } catch { /* */ } };
+const toB64 = (v) => btoa(String.fromCharCode(...new Uint8Array(v.buffer, v.byteOffset, v.length)));
+const fromB64 = (s) => new Int8Array(Uint8Array.from(atob(s), (c) => c.charCodeAt(0)).buffer);
+const embedText = (p) => `${p.title}. ${(p.abstract || "").slice(0, 1000)}`; // same as pipeline/embed.py
+
+async function embedInBrowser(texts) {
+  extractor ||= import(TJS_URL).then(({ pipeline }) =>
+    pipeline("feature-extraction", "Xenova/bge-small-en-v1.5", { dtype: "q8" }));
+  const out = (await (await extractor)(texts, { pooling: "cls", normalize: true })).tolist();
+  // Same int8 quantization as the build: each vector scaled so its largest component is ±127.
+  return out.map((v) => { const m = Math.max(...v.map(Math.abs)) || 1; return Int8Array.from(v, (x) => Math.round((x / m) * 127)); });
+}
+
+// Append one paper to the vectors and the graph, at the similarity-weighted centre of its 8 nearest papers.
+function addToGraph(id, vec) {
+  if (VEC.index.has(id) || MAP.ids.length !== VEC.index.size) return;
+  const { dim } = VEC, n = VEC.index.size;
+  const data = new Int8Array((n + 1) * dim); data.set(VEC.data); data.set(vec, n * dim);
+  const norms = new Float32Array(n + 1); norms.set(VEC.norms);
+  let ss = 0; for (const x of vec) ss += x * x; norms[n] = Math.sqrt(ss) || 1;
+  const sims = [];
+  for (let i = 0; i < n; i++) {
+    let dot = 0; for (let j = 0; j < dim; j++) dot += vec[j] * data[i * dim + j];
+    sims.push([dot / (norms[n] * norms[i]), i]);
+  }
+  const top = sims.sort((a, b) => b[0] - a[0]).slice(0, 8);
+  let x = 0, y = 0, w = 0;
+  for (const [sim, i] of top) { const k = Math.max(sim, 0) ** 4; x += MAP.xy[i][0] * k; y += MAP.xy[i][1] * k; w += k; }
+  VEC = { ...VEC, data, norms }; VEC.index.set(id, n);
+  MAP.ids.push(id); MAP.xy.push([x / (w || 1), y / (w || 1)]); MAP.nn.push(top.map(([, i]) => i)); MAP.index.set(id, n);
+}
+
+function placeFavorites() {
+  if (!VEC || !MAP || placing) return placing;
+  const missing = Object.keys(state.favorites).filter((id) => !MAP.index.has(id) && favPaper(id)?.title);
+  if (!missing.length) return null;
+  for (const id of missing) if (!byId.has(id)) byId.set(id, { ...favPaper(id), id, sections: ["bio", "ml"], favorite_only: true });
+  const cache = loadFavVecs(), todo = missing.filter((id) => !cache[id]);
+  placing = (async () => {
+    try {
+      if (todo.length) {
+        placeStatus = "loading";
+        if (state.view === "graph") renderFavs();
+        const vecs = await embedInBrowser(todo.map((id) => embedText(favPaper(id))));
+        todo.forEach((id, k) => { cache[id] = toB64(vecs[k]); });
+        saveFavVecs(cache);
+      }
+      for (const id of missing) if (cache[id]) addToGraph(id, fromB64(cache[id]));
+      placeStatus = null;
+    } catch (err) {
+      placeStatus = `Couldn't place new favorites on the graph (${err.message}).`;
+    } finally {
+      placing = null;
+      affinityCache = nearCache = null; mapNeedsFit = true;
+      render({ keepPage: true });
+      if (Object.keys(state.favorites).some((id) => !MAP.index.has(id) && !placeStatus)) placeFavorites(); // ♥'d while we were busy
+    }
+  })();
+  return placing;
+}
+
 // ---- favorites panel ----
 
 function renderFavs() {
   const favs = Object.entries(state.favorites).sort((a, b) => b[1].ts - a[1].ts);
-  const pending = favs.some(([id]) => MAP && !MAP.index.has(id));
   const notes = [
-    pending && `Newly added favorites join the graph after the next daily build${repoUrl ? ` (or <a href="${repoUrl}/actions/workflows/daily.yml" target="_blank" rel="noopener">run it now</a>)` : ""}.`,
-    favs.length && !sync.token && "Turn on Sync in ⚙︎ so the daily build can see your favorites.",
+    placeStatus === "loading" ? "Placing new favorites on the graph (the first time downloads a 34 MB model)…" : placeStatus,
+    favs.length && !sync.token && "Turn on Sync in ⚙︎ to keep favorites on every device and let the daily AI scorer learn from them.",
   ].filter(Boolean);
   $("favs").innerHTML = `
     <h3>♥ Favorites <span class="n">${favs.length}</span></h3>
@@ -768,9 +842,9 @@ function renderFavs() {
     ${favs.length ? `<ul>${favs.map(([id, f]) => {
       const p = favPaper(id), on = MAP?.index.has(id);
       return `<li data-fav="${esc(id)}">
-        <button type="button" class="fav-title" data-favact="show" ${on ? "" : "disabled"} title="${on ? "Show on the graph" : "Joins the graph after the next build"}">${esc(p?.title || id)}</button>
+        <button type="button" class="fav-title" data-favact="show" ${on ? "" : "disabled"} title="${on ? "Show on the graph" : "Not on the graph yet"}">${esc(p?.title || id)}</button>
         <input type="text" data-favact="label" value="${esc(f.label || "")}" placeholder="label" aria-label="Label">
-        <span class="st">${on ? "" : "after next build"}</span>
+        <span class="st">${on ? "" : placeStatus === "loading" ? "placing…" : "not placed"}</span>
         <button type="button" class="rm" data-favact="remove" aria-label="Remove favorite" title="Remove">✕</button>
       </li>`;
     }).join("")}</ul>` : ""}`;
