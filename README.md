@@ -26,6 +26,20 @@ python -m pipeline.build                          site/index.html + app.js
   buzz:   Hacker News · Bluesky · ScienceDaily
   merge with yesterday's data → dedup → tag
   → site/data/papers.json, older.json, ml.json ─▶  site/alerts.xml (RSS of PI + buzz hits)
+  → archive/papers-YYYY-MM.jsonl.gz ─▶ "archive" GitHub release (permanent, never pruned)
+```
+
+## Archive
+
+The site shows a rolling window; the archive keeps **every paper the build has ever seen** —
+including off-topic ones and the full ML firehose — with untruncated abstracts and author lists,
+one gzipped JSONL file per month (filed by first-seen date). It lives as assets on the repo's
+[`archive` release](https://github.com/izabellaleahz/biopapers/releases/tag/archive); each build
+rewrites only the current and previous month.
+
+```bash
+gh release download archive -R izabellaleahz/biopapers -p 'papers-*' -D archive
+.venv/bin/python -c "from pipeline.archive import load; print(len(load()))"
 ```
 
 ## Customize
@@ -77,7 +91,7 @@ committing data. Optional repo secrets/variables:
 - **No X/Twitter** — its API isn't free. Buzz uses HN + Bluesky + press coverage instead.
 - **Abstracts:** Nature/Science/Cell RSS give short summaries; we backfill from OpenAlex,
   which often has no abstract for Elsevier/Springer papers.
-- **Window:** 30 days for the general feed, 180 days for watched PIs. The ML arXiv firehose
+- **Window:** 30 days for the general feed, 180 days for watched PIs (the archive keeps everything). The ML arXiv firehose
   (~1,000 papers/day) is kept 3 days; after that only papers with HF upvotes or buzz stay.
   Saved papers keep a snapshot, so they never age out.
 - **alphaXiv** has no public API — we link to each paper's alphaXiv page rather than

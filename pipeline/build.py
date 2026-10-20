@@ -11,6 +11,7 @@ Outputs:
     site/data/older.json    the rest of the window (loaded in the background)
     site/data/ml.json       ML-only papers for the ML / CS section (loaded when you open it)
     site/alerts.xml         RSS feed of PI-watchlist + buzzing papers (subscribe for alerts)
+    archive/papers-YYYY-MM.jsonl.gz   every paper seen, untruncated and never pruned (see archive.py)
 """
 
 import argparse
@@ -21,6 +22,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .common import ROOT, client, load_config, strip_label, title_key, today
+from . import archive
 from .sources import buzz, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
@@ -231,6 +233,7 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
         # The ML firehose is huge: past a few days, keep only papers someone is paying attention to.
         if p["sections"] == ["ml"] and not p.get("buzz_score") and p["date"] < firehose_cutoff:
             continue
+        p = {**p}  # trim a copy: the archive keeps the full record
         if len(p["authors"]) > MAX_AUTHORS:
             p["n_authors"] = len(p["authors"])
             middle = [a for a in p["authors"][10:-3] if tagger.is_pi_author(a, p["pis"])]
@@ -317,12 +320,14 @@ def main() -> None:
     ml_out.write_text(json.dumps({"papers": [p for p in final if p["sections"] == ["ml"]]},
                                  ensure_ascii=False, separators=(",", ":")))
     write_alerts(final, args.site_url)
+    archived = archive.update(list(papers.values()), merge)
 
     counts = {t["slug"]: sum(t["slug"] in p["topics"] for p in final) for t in topics_cfg}
     log(f"wrote {len(final)} papers (bio {out.stat().st_size / 1e6:.1f} + {older.stat().st_size / 1e6:.1f} MB, "
         f"ml {ml_out.stat().st_size / 1e6:.1f} MB) · "
         f"PI hits {sum(bool(p['pis']) for p in final)} · buzzing {sum(p.get('buzz_score', 0) > 0 for p in final)}")
     log("  " + " · ".join(f"{k} {v}" for k, v in counts.items()))
+    log("  archive: " + " · ".join(f"{m} {n}" for m, n in archived.items()))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write  # upload the archive release assets
   pages: write
   id-token: write
 
@@ -31,6 +31,19 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Pull this month's + last month's archive files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view archive >/dev/null 2>&1 || gh release create archive \
+            --title "Paper archive" --notes "Every paper the daily build has seen, one gzipped JSONL file per month. Updated daily."
+          assets=$(gh release view archive --json assets -q '.assets[].name')
+          first=$(date -u +%Y-%m-01)
+          for m in $(date -u -d "$first" +%Y-%m) $(date -u -d "$first -1 day" +%Y-%m); do
+            f="papers-$m.jsonl.gz"
+            # A failed download must fail the job — uploading a partial month would clobber the real one.
+            if grep -qx "$f" <<<"$assets"; then gh release download archive -p "$f" -D archive; fi
+          done
       - name: Build papers.json (merged with the live site's previous data)
         env:
           SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
@@ -43,6 +56,10 @@ jobs:
             --days "${{ inputs.days || '3' }}" \
             --previous "$SITE_URL/data" \
             --site-url "$SITE_URL/"
+      - name: Push archive files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload archive archive/*.jsonl.gz --clobber
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site
