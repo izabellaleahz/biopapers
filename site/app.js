@@ -531,7 +531,7 @@ function card(p) {
         <span class="date">${esc(p.date)}</span>
         ${(p.pis || []).map((n) => `<span class="badge pi">PI · ${esc(n)}</span>`).join("")}
         ${near ? `<span class="badge near" title="Near your favorite: ${esc(favPaper(near.fav)?.title)}">♥ ${esc(favLabel(near.fav))}</span>` : ""}
-        ${p.ai ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
+        ${typeof p.ai?.score === "number" ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
         ${hot}
         ${topics.map((t) => `<span class="badge" style="--c:${t.color}">${esc(t.label)}</span>`).join("")}
       </div>

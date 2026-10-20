@@ -204,38 +204,45 @@ def complete_json(system: str, user: str, schema: dict) -> dict | None:
     return None
 
 
+def score_chunk(c: httpx.Client, system: str, chunk: list[dict], by_id: dict[str, dict]) -> tuple[int, int, float, Exception | None]:
+    """Score one request's worth of papers -> (scored, failed, cost, first error). If the safety filter
+    declines it, a single sensitive paper can sink all 20, so split in half and retry; a paper declined
+    on its own is marked so it isn't retried every day."""
+    ids = [p["id"] for p in chunk]
+    try:
+        result = openrouter_call(c, system, chunk)
+    except Exception as ex:  # one bad request shouldn't sink the rest; its papers retry next build
+        return 0, len(ids), 0.0, ex
+    cost = (result.get("usage") or {}).get("cost") or 0
+    choice = (result.get("choices") or [{}])[0]
+    reason = choice.get("finish_reason")
+    if reason == "content_filter":
+        if len(chunk) == 1:
+            by_id[ids[0]]["ai"] = {"score": None, "declined": True}
+            return 0, 0, cost, None
+        half = len(chunk) // 2
+        parts = [score_chunk(c, system, part, by_id) for part in (chunk[:half], chunk[half:])]
+        return (sum(x[0] for x in parts), sum(x[1] for x in parts), cost + sum(x[2] for x in parts),
+                next((x[3] for x in parts if x[3]), None))
+    try:
+        if reason != "stop":  # cut off: retried next build
+            raise ValueError(f"finish_reason {reason}")
+        return apply_scores(choice["message"]["content"], ids, by_id), 0, cost, None
+    except (ValueError, KeyError, TypeError) as ex:
+        return 0, len(ids), cost, ex
+
+
 def run_openrouter(todo: list[dict], system: str, by_id: dict[str, dict], log) -> None:
     todo = sorted(todo, key=lambda p: p.get("date", ""), reverse=True)[:MAX_PER_RUN]
     headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "X-Title": "biopapers"}
-    scored = failed = 0
-    cost, first_error = 0.0, None
     with httpx.Client(timeout=180, headers=headers) as c, ThreadPoolExecutor(max_workers=6) as pool:
-        chunks = chunked(todo)
-        for chunk, result in zip(chunks, pool.map(lambda ch: _try(openrouter_call, c, system, ch), chunks)):
-            ids = [p["id"] for p in chunk]
-            if isinstance(result, Exception):
-                failed += len(ids)
-                first_error = first_error or result
-                continue
-            cost += (result.get("usage") or {}).get("cost") or 0
-            choice = (result.get("choices") or [{}])[0]
-            try:
-                if choice.get("finish_reason") != "stop":  # cut off or refused: retried next build
-                    raise ValueError(f"finish_reason {choice.get('finish_reason')}")
-                scored += apply_scores(choice["message"]["content"], ids, by_id)
-            except (ValueError, KeyError, TypeError) as ex:
-                failed += len(ids)
-                first_error = first_error or ex
-    if first_error:
+        results = list(pool.map(lambda ch: score_chunk(c, system, ch, by_id), chunked(todo)))
+    scored, failed, cost = (sum(r[i] for r in results) for i in range(3))
+    declined = sum(1 for p in todo if (by_id[p["id"]].get("ai") or {}).get("declined"))
+    if first_error := next((r[3] for r in results if r[3]), None):
         log(f"  ai: first failure: {str(first_error)[:300]}")
-    log(f"  ai: openrouter {OPENROUTER_MODEL}: {scored} scored, {failed} failed · ${cost:.3f}")
-
-
-def _try(fn, *args):
-    try:
-        return fn(*args)
-    except Exception as ex:  # one bad request shouldn't sink the rest; its papers retry next build
-        return ex
+    log(f"  ai: openrouter {OPENROUTER_MODEL}: {scored} scored, {failed} failed, {declined} declined by the "
+        f"safety filter · ${cost:.3f}")
 
 
 def run(papers: list[dict], pending: list[dict], wait_min: float, log, synced: dict | None = None) -> list[dict]:
