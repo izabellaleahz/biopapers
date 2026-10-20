@@ -141,10 +141,10 @@ dialog::backdrop { background:rgba(20,15,30,.35); }
 
 .graphview { display:none; margin:14px 0 6px; }
 body.graph-mode .graphview { display:block; }
-body.graph-mode .bar { display:none; }
+body.graph-mode #tabs, body.graph-mode #chips, body.graph-mode #sortbar, body.graph-mode .controls .newonly { display:none; }
 .graph-tools { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; margin-bottom:10px; }
-.lookup-box { position:relative; flex:1 1 320px; min-width:0; }
-.lookup-box input { width:100%; box-sizing:border-box; border:1px solid var(--line); background:var(--card); color:inherit; border-radius:10px; padding:8px 12px; font-size:14px; }
+.lookup-box { position:relative; flex:1 1 280px; min-width:0; }
+.lookup-box #search { width:100%; box-sizing:border-box; }
 .lookup-results { position:absolute; z-index:5; left:0; right:0; top:calc(100% + 4px); max-height:60vh; overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:10px; box-shadow:0 8px 28px rgba(0,0,0,.14); padding:6px 0; }
 .lookup-results ul { list-style:none; margin:0; padding:0; }
 .lookup-results li { display:flex; align-items:flex-start; gap:10px; padding:7px 12px; }
@@ -188,3 +188,5 @@ body.graph-mode .bar { display:none; }
 .takehome.busy { color:var(--muted); font-style:italic; }
 .takehome.err { color:var(--danger); border-left-color:var(--danger); }
 .th-meta { color:var(--muted); font-size:11px; margin-top:6px; }
+.heart.save.on { color:#e6b422; border-color:#e6b422; }
+.chip .n { color:var(--muted); font-weight:400; }

@@ -17,8 +17,6 @@ const NEAR_K = 25; // each favorite pulls its 25 most similar papers into "Near 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).
 const SPECIAL_TABS = {
   foryou: { label: "For You", color: "var(--ink)" },
-  mustread: { label: "Must read", color: "#e6b422" },
-  nearfav: { label: "♥ Near favorites", color: "var(--hot)" },
   pis: { label: "PI Watch", color: "#a98fd6" },
   buzz: { label: "Buzz", color: "var(--hot)" },
   mlforyou: { label: "For You", color: "var(--ink)" },
@@ -26,8 +24,8 @@ const SPECIAL_TABS = {
   saved: { label: "Saved", color: "#f2b15c" },
 };
 const SECTION_TABS = {
-  bio: { head: ["foryou", "mustread", "nearfav"], tail: ["pis", "buzz", "saved"] },
-  ml: { head: ["mlforyou", "mustread", "nearfav", "trending"], tail: ["saved"] },
+  bio: { head: ["foryou"], tail: ["pis", "buzz", "saved"] },
+  ml: { head: ["mlforyou", "trending"], tail: ["saved"] },
 };
 const HOT_TABS = new Set(["buzz", "trending"]);
 
@@ -36,8 +34,8 @@ const WEIGHTS = {
   ai: { label: "AI relevance (Claude's 0–10 score for you)", def: 1 },
   buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
   pi: { label: "Watched PIs", def: 1 },
-  affinity: { label: "Similar to my favorites, saves and upvotes", def: 0.8 },
-  vote: { label: "My upvotes", def: 0.3 },
+  affinity: { label: "Similar to my favorites and saves (less like what I mark not interested)", def: 0.8 },
+  vote: { label: "Saved by me", def: 0.3 },
 };
 
 const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
@@ -102,7 +100,8 @@ let favsLoaded = null; // favorites.json: favorites outside the window (on the g
 
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
-let ui = { shown: PAGE, query: "", newOnly: false, pi: null, favLabel: null, graphQuery: "",
+let ui = { shown: PAGE, query: "", newOnly: false, pi: null, forYou: null, // For You chip: null | "must" | "near" | "label:…"
+  lastCount: 0,
   takehomeOpen: new Set(), takehomeBusy: new Map() }; // busy: id -> status text (or "error: …")
 
 const has = (map, p) => !!(map[p.id] || (p.aliases || []).some((a) => map[a]));
@@ -123,7 +122,7 @@ function addPapers(list) {
 }
 
 function loadML() {
-  mlLoaded ||= fetchPapers("ml.json").then((list) => { addPapers(list); render({ keepPage: true }); });
+  mlLoaded ||= fetchPapers("ml.json").then((list) => { addPapers(list); migrateVotes(); render({ keepPage: true }); });
   return mlLoaded;
 }
 
@@ -138,6 +137,7 @@ async function load() {
   render();
   if (state.section === "ml") await loadML();
   addPapers(await fetchPapers("older.json"));
+  migrateVotes();
   render({ keepPage: true });
   loadVectors();
 }
@@ -175,6 +175,19 @@ function loadMap() {
   ]).then(([m]) => { if (m) MAP = { ...m, index: new Map(m.ids.map((id, i) => [id, i])) }; })
     .finally(() => { mapNeedsFit = true; render({ keepPage: true }); placeFavorites(); });
   return mapLoaded;
+}
+
+// Upvotes were a lab-feed idea; for one person they meant "save". Fold each into a save once its paper
+// is loaded (old ones whose paper has aged out stay as a quiet ranking signal).
+function migrateVotes() {
+  const ids = Object.keys(state.votes).filter((id) => byId.has(id));
+  if (!ids.length) return;
+  for (const id of ids) {
+    const p = byId.get(id);
+    if (!has(state.saved, p)) state.saved[id] = { ts: state.votes[id] || Date.now(), paper: snapshot(p) };
+  }
+  forget("votes", ids);
+  persist();
 }
 
 const vecRow = (p) => [p.id, ...(p.aliases || [])].map((k) => VEC.index.get(k)).find((i) => i !== undefined);
@@ -265,6 +278,14 @@ function embeddingAffinity(liked) {
     for (let j = 0; j < dim; j++) prof[j] += data[r * dim + j] / norms[r];
   }
   if (!any) return false;
+  // Push the profile away from what you marked not interested (the 200 most recent), at half weight.
+  const hidden = Object.entries(state.hidden).sort((a, b) => b[1] - a[1]).slice(0, 200)
+    .map(([id]) => VEC.index.get(id)).filter((r) => r !== undefined);
+  const nLiked = [...liked].filter((id) => VEC.index.has(id)).length;
+  for (const r of hidden) {
+    const wgt = 0.5 * nLiked / hidden.length;
+    for (let j = 0; j < dim; j++) prof[j] -= wgt * data[r * dim + j] / norms[r];
+  }
   let pn = 0; for (const x of prof) pn += x * x; pn = Math.sqrt(pn) || 1;
   const sims = [];
   for (const p of DATA.papers) {
@@ -347,10 +368,17 @@ function inTab(p, tab) {
   if (tab === "foryou") return (sectionTopics(p).length || p.pis?.length) && topicWeight(p) > 0;
   if (tab === "mlforyou") return topicWeight(p) > 0;
   if (tab === "pis") return p.pis?.length > 0;
-  if (tab === "mustread") return (p.ai?.score ?? 0) >= MUST_READ && topicWeight(p) > 0;
-  if (tab === "nearfav") return nearFavorites().has(p.id);
   if (HOT_TABS.has(tab)) return (p.buzz_score || 0) > 0;
   return p.topics?.includes(tab);
+}
+
+// For You's filter chips: Must read, papers near any favorite, or near the favorites with one label.
+function forYouChip(chip) {
+  if (chip === "must") return (p) => (p.ai?.score ?? 0) >= MUST_READ;
+  const near = nearFavorites();
+  if (chip === "near") return (p) => near.has(p.id);
+  const label = chip.slice("label:".length);
+  return (p) => state.favorites[near.get(p.id)?.fav]?.label === label;
 }
 
 function savedPapers() {
@@ -366,10 +394,7 @@ function visiblePapers() {
   const tab = curTab();
   let list = tab === "saved" ? savedPapers() : DATA.papers.filter((p) => inTab(p, tab) && !has(state.hidden, p));
   if (tab === "pis" && ui.pi) list = list.filter((p) => p.pis.includes(ui.pi));
-  if (tab === "nearfav" && ui.favLabel) {
-    const near = nearFavorites();
-    list = list.filter((p) => state.favorites[near.get(p.id)?.fav]?.label === ui.favLabel);
-  }
+  if ((tab === "foryou" || tab === "mlforyou") && ui.forYou) list = list.filter(forYouChip(ui.forYou));
   if (ui.newOnly) list = list.filter(isNew);
   if (ui.query) {
     const q = ui.query.toLowerCase();
@@ -435,17 +460,25 @@ function render({ keepPage = false } = {}) {
     ? [null, ...DATA.people.map((p) => p.name)].map((name) =>
         `<button class="chip ${ui.pi === name ? "active" : ""}" data-pi="${esc(name ?? "")}"
           title="${esc(DATA.people.find((x) => x.name === name)?.note || "")}">${esc(name ?? "All PIs")}</button>`).join("")
-    : tab === "nearfav"
-    ? [null, ...new Set(Object.values(state.favorites).map((f) => f.label).filter(Boolean))].map((l) =>
-        `<button class="chip ${ui.favLabel === l ? "active" : ""}" data-favlabel="${esc(l ?? "")}">${esc(l ?? "All favorites")}</button>`).join("")
+    : tab === "foryou" || tab === "mlforyou"
+    ? (() => {
+        const base = DATA.papers.filter((p) => inTab(p, tab) && visible(p));
+        const labels = [...new Set(Object.values(state.favorites).map((f) => f.label).filter(Boolean))];
+        const chips = [[null, "All"], ["must", "Must read"],
+          ...(Object.keys(state.favorites).length ? [["near", "♥ Near favorites"]] : []),
+          ...labels.map((l) => [`label:${l}`, `♥ ${l}`])];
+        return chips.map(([k, label]) => `<button class="chip ${ui.forYou === k ? "active" : ""}" data-foryou="${esc(k ?? "")}">${esc(label)}${
+          k ? ` <span class="n">${base.filter(forYouChip(k)).length}</span>` : ""}</button>`).join("");
+      })()
     : "";
 
   const list = visiblePapers();
+  ui.lastCount = list.length;
   $("feed").innerHTML = list.length
     ? list.slice(0, ui.shown).map(card).join("")
     : `<div class="empty">${tab === "saved" ? "Nothing saved yet — hit ☆ on a paper."
-      : tab === "nearfav" ? (Object.keys(state.favorites).length ? "Nothing yet. Papers near your favorites show up once their embeddings load, after the next build for newly added ones."
-        : "Hit ♥ on papers you love, or look up any paper in Graph, and new papers near them collect here.")
+      : ui.forYou === "must" ? "Nothing in Must read yet. It fills in as the daily AI scoring runs."
+      : ui.forYou ? "Nothing near your favorites yet (they need the embeddings, which load a few seconds after the page)."
       : "No papers match."}</div>`;
   $("more").hidden = list.length <= ui.shown;
   $("more").textContent = `Show more (${list.length - ui.shown} left)`;
@@ -465,7 +498,7 @@ function card(p) {
   const lastNames = new Set((p.pis || []).map((n) => n.split(" ").pop().toLowerCase()));
   const authors = (p.authors || []).map((a) =>
     lastNames.has(a.split(" ").pop().toLowerCase()) ? `<b>${esc(a)}</b>` : esc(a)).join(", ");
-  const voted = has(state.votes, p), saved = has(state.saved, p), fav = has(state.favorites, p);
+  const saved = has(state.saved, p), fav = has(state.favorites, p);
   const near = nearCache?.get(p.id);
   const hot = [
     hf.upvotes && arxivId ? `<a class="badge hot" href="https://huggingface.co/papers/${esc(arxivId)}" target="_blank" rel="noopener" title="Hugging Face Daily Papers upvotes">▲ ${hf.upvotes} HF</a>` : "",
@@ -485,10 +518,9 @@ function card(p) {
 
   return `<article class="paper" style="--c:${color}" data-id="${esc(p.id)}">
     <div class="actions">
-      <button class="${voted ? "on" : ""}" data-act="vote" aria-label="Upvote" title="Upvote">▲</button>
       <button class="${saved ? "on" : ""}" data-act="save" aria-label="Save" title="Save">${saved ? "★" : "☆"}</button>
       <button class="${fav ? "on fav" : ""}" data-act="fav" aria-label="Favorite" title="Favorite: a landmark paper the Graph and Near favorites center on">♥</button>
-      <button class="hide" data-act="hide" aria-label="Hide" title="${curTab() === "saved" ? "Unsave" : "Hide"}">✕</button>
+      <button class="hide" data-act="hide" aria-label="${curTab() === "saved" ? "Unsave" : "Not interested"}" title="${curTab() === "saved" ? "Unsave" : "Not interested: hide it, and rank papers like it lower"}">✕</button>
     </div>
     <div class="body">
       <h3><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
@@ -548,13 +580,12 @@ $("feed").addEventListener("click", (e) => {
   if (act === "takehome") { takeHome(p); return; }
   if (act === "takehome-redo") { takeHome(p, { redo: true }); return; }
   if (act === "fav") toggleFavorite(p);
-  if (act === "vote") toggle("votes", p, Date.now());
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
   if (act === "hide") {
     if (curTab() === "saved") toggle("saved", p);
     else state.hidden[p.id] = Date.now();
   }
-  if (act !== "hide") affinityCache = nearCache = null;
+  affinityCache = nearCache = null; // hides count too: "not interested" pushes similar papers down
   persist();
   render({ keepPage: true });
 });
@@ -586,15 +617,23 @@ $("sections").addEventListener("click", (e) => {
 $("chips").addEventListener("click", (e) => {
   const c = e.target.closest("[data-pi]");
   if (c) { ui.pi = c.dataset.pi || null; render(); }
-  const f = e.target.closest("[data-favlabel]");
-  if (f) { ui.favLabel = f.dataset.favlabel || null; render(); }
+  const f = e.target.closest("[data-foryou]");
+  if (f) { ui.forYou = f.dataset.foryou || null; render(); }
 });
 $("more").addEventListener("click", () => { ui.shown += PAGE; render({ keepPage: true }); });
 $("new-only").addEventListener("change", (e) => { ui.newOnly = e.target.checked; render(); });
+// One search box for both views: it filters the feed (or dims the graph), and from 3 characters on
+// also looks the query up across the literature, with ☆ / ♥ on every result.
 let searchTimer;
 $("search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => { ui.query = e.target.value.trim(); render(); }, 150);
+  searchTimer = setTimeout(() => {
+    ui.query = e.target.value.trim();
+    if (state.view === "graph" && MAP) { for (const q of mapPts) q.dim = !matchesGraph(q.p); drawMap(); }
+    else render();
+    if (ui.query.length >= 3) lookup(ui.query);
+    else { lookupResults = []; renderLookup(""); }
+  }, 250);
 });
 
 // ---- graph -------------------------------------------------------------------------
@@ -647,7 +686,7 @@ function fitMap(indexes) {
 }
 
 function matchesGraph(p) {
-  const q = ui.graphQuery.toLowerCase();
+  const q = ui.query.toLowerCase();
   return !q || `${p.title} ${(p.authors || []).join(" ")} ${p.abstract || ""} ${p.venue || ""}`.toLowerCase().includes(q);
 }
 
@@ -928,8 +967,9 @@ function fromOpenAlex(w) {
 
 let lookupSeq = 0;
 async function lookup(q) {
-  const seq = ++lookupSeq, ref = paperRef(q), lq = q.toLowerCase();
-  const local = ref && byId.has(ref) ? [byId.get(ref)]
+  const seq = ++lookupSeq, ref = paperRef(q), lq = q.toLowerCase(), graph = state.view === "graph";
+  // On the graph, list matching papers already there too; in the feed they're the filtered list below.
+  const local = !graph ? [] : ref && byId.has(ref) ? [byId.get(ref)]
     : [...byId.values()].filter((p) => p.title.toLowerCase().includes(lq)).slice(0, 6);
   lookupResults = local.map((p) => ({ p, local: true }));
   renderLookup(q.length >= 3 ? "searching the literature…" : "");
@@ -946,49 +986,48 @@ async function lookup(q) {
   } catch { /* offline: local results only */ }
   if (seq !== lookupSeq) return;
   const seen = new Set(lookupResults.map((r) => r.p.id));
-  for (const p of remote) if (!seen.has(p.id)) { seen.add(p.id); lookupResults.push(byId.has(p.id) ? { p: byId.get(p.id), local: true } : { p, local: false }); }
+  for (const p of remote) {
+    if (seen.has(p.id) || (!graph && byId.has(p.id) && DATA.papers.includes(byId.get(p.id)))) continue; // already in the feed
+    seen.add(p.id);
+    lookupResults.push(byId.has(p.id) ? { p: byId.get(p.id), local: graph } : { p, local: false });
+  }
   renderLookup(lookupResults.length ? "" : "No papers found.");
 }
 
 function renderLookup(status) {
   const row = (r, i) => {
-    const p = r.p, fav = has(state.favorites, p), on = MAP?.index.has(p.id);
+    const p = r.p, fav = has(state.favorites, p), saved = has(state.saved, p), on = MAP?.index.has(p.id);
     const meta = [p.venue, (p.date || "").slice(0, 4), (p.authors || []).filter((a) => a !== "…").slice(0, 3).join(", ")].filter(Boolean).join(" · ");
     return `<li data-lk="${i}">
+      <button type="button" class="heart save ${saved ? "on" : ""}" data-lkact="save" aria-label="${saved ? "Unsave" : "Save"}" title="${saved ? "Unsave" : "Save for later"}">${saved ? "★" : "☆"}</button>
       <button type="button" class="heart ${fav ? "on" : ""}" data-lkact="fav" aria-label="${fav ? "Remove favorite" : "Add to favorites"}" title="${fav ? "Remove favorite" : "Add to favorites"}">♥</button>
       <div class="lk-body"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a><div class="lk-meta">${esc(meta)}</div></div>
-      ${on ? `<button type="button" class="lk-show" data-lkact="show">show</button>` : ""}
+      ${on && state.view === "graph" ? `<button type="button" class="lk-show" data-lkact="show">show</button>` : ""}
     </li>`;
   };
   const local = lookupResults.map((r, i) => [r, i]).filter(([r]) => r.local);
   const remote = lookupResults.map((r, i) => [r, i]).filter(([r]) => !r.local);
-  $("lookup-results").hidden = !ui.graphQuery;
-  $("lookup-results").innerHTML = (local.length ? `<div class="lk-sec">In your feed</div><ul>${local.map(([r, i]) => row(r, i)).join("")}</ul>` : "")
+  $("lookup-results").hidden = ui.query.length < 3;
+  const inFeed = state.view !== "graph" && ui.query
+    ? `<div class="lk-status">${ui.lastCount.toLocaleString()} match${ui.lastCount === 1 ? "" : "es"} in your feed below · Esc to see them</div>` : "";
+  $("lookup-results").innerHTML = inFeed + (local.length ? `<div class="lk-sec">In your feed</div><ul>${local.map(([r, i]) => row(r, i)).join("")}</ul>` : "")
     + (remote.length ? `<div class="lk-sec">From the literature · OpenAlex</div><ul>${remote.map(([r, i]) => row(r, i)).join("")}</ul>` : "")
     + (status ? `<div class="lk-status">${esc(status)}</div>` : "");
 }
 
-let lookupTimer;
-$("lookup").addEventListener("input", (e) => {
-  clearTimeout(lookupTimer);
-  ui.graphQuery = e.target.value.trim();
-  if (!ui.graphQuery) { lookupResults = []; renderLookup(""); }
-  lookupTimer = setTimeout(() => {
-    if (MAP) { for (const q of mapPts) q.dim = !matchesGraph(q.p); drawMap(); }
-    if (ui.graphQuery) lookup(ui.graphQuery);
-  }, 300);
-});
 document.addEventListener("click", (e) => {
   // A ♥ in the results re-renders the list, detaching the clicked button: that's not an outside click.
   if (e.target.isConnected && !e.target.closest(".lookup-box")) $("lookup-results").hidden = true;
 });
-$("lookup").addEventListener("focus", () => { if (ui.graphQuery) $("lookup-results").hidden = false; });
-$("lookup").addEventListener("keydown", (e) => { if (e.key === "Escape") $("lookup-results").hidden = true; });
+$("search").addEventListener("focus", () => { if (ui.query.length >= 3) $("lookup-results").hidden = false; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lookup-results").hidden = true; });
 $("lookup-results").addEventListener("click", (e) => {
   const b = e.target.closest("[data-lkact]"), r = lookupResults[b?.closest("[data-lk]")?.dataset.lk];
   if (!r) return;
   if (b.dataset.lkact === "show") { mapFocus = r.p.id; render({ keepPage: true }); return; }
-  toggleFavorite(r.p);
+  if (b.dataset.lkact === "save") toggle("saved", r.p, { ts: Date.now(), paper: snapshot(r.p) });
+  else toggleFavorite(r.p);
+  affinityCache = nearCache = null;
   persist(); renderLookup(""); render({ keepPage: true });
 });
 $("graph-sections").addEventListener("click", (e) => {

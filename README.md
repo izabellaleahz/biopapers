@@ -8,7 +8,8 @@ Lowkey, alphaXiv-inspired paper feed for the Gilbert lab, in two sections:
   Hugging Face Daily Papers, with a "Trending" tab (HF upvotes · HN · Bluesky), AI TL;DRs,
   code links + GitHub stars, and alphaXiv discussion links.
 
-Saves, upvotes and ranking settings work across both.
+Save (☆), favorite (♥) and not-interested (✕) work across both, and so does the one search box:
+it filters your feed and also finds any paper in the literature (title, DOI or arXiv ID).
 
 Static site — a daily GitHub Action fetches everything, writes JSON, and deploys to
 GitHub Pages. No server, no database. Your saves/upvotes/settings live in your browser, and can
@@ -56,8 +57,9 @@ All in `config/` — edit, push, and the next build picks it up (and re-tags eve
 | `config/sources.yaml` | Journal RSS feeds, OpenAlex-by-ISSN journals, ML arXiv categories + HF, buzz sources |
 | `config/profile.md` | Who the AI scorer is reading for — plain prose; edit it to change what counts as a must-read |
 
-In the site itself (⚙︎): ranking weights for **For You** (recency, buzz, PIs, similarity to
-what you save/upvote, your upvotes), recency half-life, tab order/visibility, per-topic weights,
+**For You** is the home tab, with chips for Must read, ♥ Near favorites and each favorite label.
+In the site itself (⚙︎): ranking weights for For You (recency, AI score, buzz, PIs, similarity to
+your favorites and saves), recency half-life, tab order/visibility, per-topic weights,
 export/import of your data, saved → BibTeX.
 
 ## AI scores, embeddings and the map
@@ -65,7 +67,7 @@ export/import of your data, saved → BibTeX.
 - **Must read** — every paper gets a 0–10 relevance score, a one-line TL;DR and a few words on
   why it matters, from Claude Haiku 5.5 reading the title + abstract against `config/profile.md`
   (plus your saved / upvoted papers, if `BIOPAPERS_GIST_ID` is set). Papers scoring ≥ 6 land in the
-  Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Uses
+  Must read chip of For You, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Uses
   `ANTHROPIC_API_KEY` (Message Batches API, half price, ~$2/month) or else `OPENROUTER_API_KEY`
   (`anthropic/claude-haiku-5.5`, direct calls, ~$3–4/month, at most 3,000 papers per build).
 - **Take-home (on demand)** — a button on every paper asks Claude for its main message, key findings,
@@ -84,7 +86,7 @@ export/import of your data, saved → BibTeX.
 - **♥ Favorites** — landmark papers, separate from saves. ♥ any card, or look up *any* paper in the
   Graph's search box (your feed, or the whole literature via OpenAlex, by title / DOI / arXiv ID).
   They sync through the gist, never age out, steer For You and the AI scorer, and give each label its
-  own group in the **♥ Near favorites** tab, which works like a topic defined by example papers.
+  own chip in For You (♥ Near favorites, ♥ <label>), which works like a topic defined by example papers.
   A favorite from outside the feed is embedded right in the browser (same model, via transformers.js —
   a one-time 34 MB download) and placed next to its nearest papers immediately. With Gist sync +
   `BIOPAPERS_GIST_ID` the daily build also picks favorites up (for the AI scorer and other devices);

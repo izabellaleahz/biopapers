@@ -27,7 +27,10 @@
         <label class="newonly" title="Only papers added since your last visit">
           <input type="checkbox" id="new-only"> <span id="new-label">new</span>
         </label>
-        <input type="search" id="search" placeholder="Search title, authors, abstract…" aria-label="Search">
+        <div class="lookup-box">
+          <input type="search" id="search" placeholder="Search your feed, or find any paper by title, DOI or arXiv ID" aria-label="Search" autocomplete="off">
+          <div id="lookup-results" class="lookup-results" hidden></div>
+        </div>
       </div>
       <div class="chips" id="chips"></div>
     </div>
@@ -36,10 +39,6 @@
   <div class="wrap">
     <section id="graphview" class="graphview">
       <div class="graph-tools">
-        <div class="lookup-box">
-          <input type="search" id="lookup" placeholder="Look up any paper (title, DOI or arXiv ID) to ♥ it" aria-label="Look up a paper" autocomplete="off">
-          <div id="lookup-results" class="lookup-results" hidden></div>
-        </div>
         <div class="sortbar" id="graph-sections" role="group" aria-label="Section">
           <button data-gsec="all">All</button><button data-gsec="bio">Bio</button><button data-gsec="ml">ML / CS</button>
         </div>
@@ -50,7 +49,7 @@
         <div id="map-tip" class="map-tip" hidden></div>
       </div>
       <div class="map-bar" id="graph-legend">
-        <span><span class="heart">♥</span> favorite · <span class="ring">○</span> saved or upvoted · scroll or pinch to zoom, drag to pan · <span id="graph-note"></span></span>
+        <span><span class="heart">♥</span> favorite · <span class="ring">○</span> saved · scroll or pinch to zoom, drag to pan · <span id="graph-note"></span></span>
         <label><input type="checkbox" id="map-regions" checked> region names</label>
         <label><input type="checkbox" id="map-links"> all links</label>
         <button type="button" id="map-reset">fit view</button>
