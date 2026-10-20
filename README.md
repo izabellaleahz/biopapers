@@ -68,6 +68,11 @@ export/import of your data, saved → BibTeX.
   Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Uses
   `ANTHROPIC_API_KEY` (Message Batches API, half price, ~$2/month) or else `OPENROUTER_API_KEY`
   (`anthropic/claude-haiku-5.5`, direct calls, ~$3–4/month, at most 3,000 papers per build).
+- **Take-home (on demand)** — a button on every paper asks Claude for its main message, key findings,
+  approach and caveats, only when you click. It reads the open-access full text from Europe PMC when
+  there is one (else the abstract) and calls OpenRouter straight from your browser with a key you paste
+  in ⚙︎ (kept in that browser only — make a separate key with a credit limit). Pick Opus / Sonnet /
+  Haiku 5.5 there; results are cached and synced, so each paper is paid for once.
 - **Embeddings** — bge-small-en-v1.5 over title + abstract, computed on the Actions runner (free).
   They power "Similar to what I save / upvote" in For You and the **similar papers** button.
 - **Graph** — its own view next to Bio | ML / CS: a UMAP layout of the embeddings, colored by topic.

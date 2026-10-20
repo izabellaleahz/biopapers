@@ -8,7 +8,7 @@
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden", "favorites"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
 const DAY = 86400000;
 const MUST_READ = 7; // AI score (0–10) at which a paper lands in "Must read"
@@ -45,7 +45,7 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {}, favorites: {}, removed: {}, settingsAt: 0,
+  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(WEIGHTS).map(([k, w]) => [k, w.def])),
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
@@ -102,7 +102,8 @@ let favsLoaded = null; // favorites.json: favorites outside the window (on the g
 
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
-let ui = { shown: PAGE, query: "", newOnly: false, pi: null, favLabel: null, graphQuery: "" };
+let ui = { shown: PAGE, query: "", newOnly: false, pi: null, favLabel: null, graphQuery: "",
+  takehomeOpen: new Set(), takehomeBusy: new Map() }; // busy: id -> status text (or "error: …")
 
 const has = (map, p) => !!(map[p.id] || (p.aliases || []).some((a) => map[a]));
 const isNew = (p) => prevVisitDay && p.added > prevVisitDay;
@@ -505,7 +506,8 @@ function card(p) {
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
       ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
       ${p.abstract ? `<div class="abstract">${esc(p.abstract)}</div>` : ""}
-      <div class="links">${links.join("")}<button type="button" class="linkbtn" data-act="map" title="Show it on the Graph with its nearest neighbours">similar papers</button></div>
+      ${takehomeHTML(p)}
+      <div class="links">${links.join("")}<button type="button" class="linkbtn th-btn" data-act="takehome" title="A short take-home summary, written on demand">${state.summaries[p.id] ? (ui.takehomeOpen.has(p.id) ? "hide take-home" : "take-home ✓") : "take-home"}</button><button type="button" class="linkbtn" data-act="map" title="Show it on the Graph with its nearest neighbours">similar papers</button></div>
     </div>
   </article>`;
 }
@@ -543,6 +545,8 @@ $("feed").addEventListener("click", (e) => {
   if (!p) return;
   const act = btn.dataset.act;
   if (act === "map") { showOnMap(p); return; }
+  if (act === "takehome") { takeHome(p); return; }
+  if (act === "takehome-redo") { takeHome(p, { redo: true }); return; }
   if (act === "fav") toggleFavorite(p);
   if (act === "vote") toggle("votes", p, Date.now());
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
@@ -1035,6 +1039,143 @@ $("graph-around").addEventListener("change", (e) => {
   });
 })();
 
+// ---- on-demand take-homes ----------------------------------------------------------
+// The "take-home" button asks Claude (through OpenRouter, with a key kept in this browser) for a short
+// summary of one paper: the main message, key findings, approach and caveats. It reads the open-access
+// full text from Europe PMC when there is one, else the abstract. Results are cached (and synced with
+// your other state), so each paper costs once; nothing runs until you click.
+
+const OR_KEY = "biopapers:openrouter"; // { key, model } — never exported or synced
+const TAKEHOME_MODELS = {
+  "anthropic/claude-opus-5.5": { label: "Claude Opus 5.5", cost: "≈ 2¢ from an abstract, 6–8¢ from full text" },
+  "anthropic/claude-sonnet-5.5": { label: "Claude Sonnet 5.5", cost: "≈ 1¢ from an abstract, 3–4¢ from full text" },
+  "anthropic/claude-haiku-5.5": { label: "Claude Haiku 5.5", cost: "under ¼¢ from an abstract, ≈ ½¢ from full text" },
+};
+let orConf = (() => { try { return JSON.parse(localStorage.getItem(OR_KEY)) || {}; } catch { return {}; } })();
+orConf.model = TAKEHOME_MODELS[orConf.model] ? orConf.model : "anthropic/claude-opus-5.5";
+const saveOrConf = () => { try { localStorage.setItem(OR_KEY, JSON.stringify(orConf)); } catch { /* */ } };
+
+const TAKEHOME_SYSTEM = `You write the take-home of one research paper for a busy scientist who will not read it. Be concrete and specific: name the system, method, and effect sizes where given. Don't hype, and don't restate the title. If you only have the abstract, stick to what it supports.
+Return JSON with:
+- take_home: 2-3 sentences: the main message, and why it matters.
+- key_findings: 3-5 short bullets, each one concrete result (with numbers where the text gives them).
+- approach: 1-2 sentences on how they did it (model system, data, method).
+- caveats: 1-2 sentences on limitations or what the work doesn't show.`;
+const TAKEHOME_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["take_home", "key_findings", "approach", "caveats"],
+  properties: { take_home: { type: "string" }, key_findings: { type: "array", items: { type: "string" } },
+                approach: { type: "string" }, caveats: { type: "string" } },
+};
+
+// Open-access full text from Europe PMC (sections as "## Title" + paragraphs), or null.
+async function europePmcText(p) {
+  if (!p.doi) return null;
+  const q = encodeURIComponent(`DOI:"${p.doi}"`);
+  const hits = (await (await fetch(`https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${q}&resultType=core&format=json`)).json())
+    .resultList?.result || [];
+  const hit = hits.find((x) => x.pmcid && x.isOpenAccess === "Y");
+  if (!hit) return null;
+  const res = await fetch(`https://www.ebi.ac.uk/europepmc/webservices/rest/${hit.pmcid}/fullTextXML`);
+  if (!res.ok) return null;
+  const body = new DOMParser().parseFromString(await res.text(), "application/xml").querySelector("body");
+  if (!body) return null;
+  body.querySelectorAll("xref, table, graphic, supplementary-material, ref-list").forEach((n) => n.remove());
+  const parts = [];
+  const walk = (el) => {
+    for (const c of el.children) {
+      if (c.tagName === "title") parts.push(`\n## ${c.textContent.trim()}`);
+      else if (c.tagName === "p" || c.tagName === "caption") parts.push(c.textContent.replace(/\s+/g, " ").trim());
+      else walk(c);
+    }
+  };
+  walk(body);
+  const text = parts.join("\n").trim();
+  return text.length > 2000 ? text.slice(0, 60000) : null; // ~15k tokens at most
+}
+
+async function takeHome(p, { redo = false } = {}) {
+  const id = p.id;
+  if (state.summaries[id] && !redo) {
+    ui.takehomeOpen.has(id) ? ui.takehomeOpen.delete(id) : ui.takehomeOpen.add(id);
+    return render({ keepPage: true });
+  }
+  if (ui.takehomeBusy.has(id) && !ui.takehomeBusy.get(id).startsWith("error")) return;
+  ui.takehomeOpen.add(id);
+  if (!orConf.key) {
+    ui.takehomeBusy.set(id, "error: Add an OpenRouter key in ⚙︎ → On-demand take-homes first.");
+    return render({ keepPage: true });
+  }
+  ui.takehomeBusy.set(id, "Looking for open-access full text…"); render({ keepPage: true });
+  let text = null, source = "abstract";
+  try { text = await europePmcText(p); if (text) source = "full text (Europe PMC)"; } catch { /* abstract it is */ }
+  ui.takehomeBusy.set(id, `Reading the ${text ? "full text" : "abstract"}…`); render({ keepPage: true });
+  const paper = `${p.title}\n${[p.venue, p.date, (p.authors || []).filter((a) => a !== "…").slice(0, 6).join(", ")].filter(Boolean).join(" · ")}\n\n`
+    + (text || `Abstract: ${p.abstract || "(no abstract available)"}`);
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${orConf.key}`, "Content-Type": "application/json", "X-Title": "biopapers" },
+      body: JSON.stringify({
+        model: orConf.model, max_tokens: 6000, reasoning: { effort: "low" }, usage: { include: true },
+        messages: [{ role: "system", content: TAKEHOME_SYSTEM }, { role: "user", content: paper }],
+        response_format: { type: "json_schema", json_schema: { name: "takehome", strict: true, schema: TAKEHOME_SCHEMA } },
+      }),
+    });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(out.error?.message || `OpenRouter ${res.status}`);
+    const choice = out.choices?.[0];
+    if (choice?.finish_reason !== "stop") throw new Error(`the model stopped early (${choice?.finish_reason || "no answer"})`);
+    const data = JSON.parse(choice.message.content);
+    state.summaries[id] = { ts: Date.now(), model: orConf.model, source, cost: out.usage?.cost ?? null, data };
+    ui.takehomeBusy.delete(id);
+    persist();
+  } catch (err) {
+    ui.takehomeBusy.set(id, `error: ${err.message}`);
+  }
+  render({ keepPage: true });
+}
+
+function takehomeHTML(p) {
+  if (!ui.takehomeOpen.has(p.id)) return "";
+  const busy = ui.takehomeBusy.get(p.id), s = state.summaries[p.id];
+  if (busy) return `<div class="takehome ${busy.startsWith("error") ? "err" : "busy"}">${esc(busy.replace(/^error: /, ""))}</div>`;
+  if (!s) return "";
+  const d = s.data, model = TAKEHOME_MODELS[s.model]?.label || s.model;
+  return `<div class="takehome">
+    <p class="th-main">${esc(d.take_home)}</p>
+    ${d.key_findings?.length ? `<ul>${d.key_findings.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
+    ${d.approach ? `<p><b>How</b> ${esc(d.approach)}</p>` : ""}
+    ${d.caveats ? `<p><b>Caveats</b> ${esc(d.caveats)}</p>` : ""}
+    <div class="th-meta">from the ${esc(s.source)} · ${esc(model)}${s.cost != null ? ` · $${(+s.cost).toFixed(3)}` : ""}
+      · <button type="button" class="linkbtn" data-act="takehome-redo">redo</button></div>
+  </div>`;
+}
+
+function renderTakehomeSettings() {
+  $("or-box").innerHTML = `
+    <p class="hint">The take-home button on each paper asks Claude for a short summary, only when you click it.
+      Paste an <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener">OpenRouter key</a>; it stays in this
+      browser and is never exported or synced. Best to make a separate key with a small credit limit.</p>
+    <div class="btnrow">${orConf.key
+      ? `<span class="hint">Key saved (…${esc(orConf.key.slice(-4))})</span><button type="button" data-or="forget">Forget key</button>`
+      : `<input type="password" id="or-key" placeholder="sk-or-…" autocomplete="off" aria-label="OpenRouter key"><button type="button" data-or="save">Save</button>`}</div>
+    <label class="row">Model
+      <select id="or-model">${Object.entries(TAKEHOME_MODELS).map(([k, m]) =>
+        `<option value="${k}" ${k === orConf.model ? "selected" : ""}>${esc(m.label)}</option>`).join("")}</select>
+    </label>
+    <p class="hint">${esc(TAKEHOME_MODELS[orConf.model].cost)} per paper.</p>`;
+}
+$("or-box").addEventListener("click", (e) => {
+  const act = e.target.closest("[data-or]")?.dataset.or;
+  if (act === "save") { const k = $("or-key").value.trim(); if (k) { orConf.key = k; saveOrConf(); } }
+  if (act === "forget") { delete orConf.key; saveOrConf(); }
+  if (act) renderTakehomeSettings();
+});
+$("or-box").addEventListener("change", (e) => {
+  if (e.target.id === "or-model") { orConf.model = e.target.value; saveOrConf(); renderTakehomeSettings(); }
+});
+
 // ---- settings ---------------------------------------------------------------
 
 function renderSettings() {
@@ -1045,6 +1186,7 @@ function renderSettings() {
     </label>`).join("");
   $("halflife").value = String(state.halfLife);
   renderSync();
+  renderTakehomeSettings();
 
   const tabs = allTabs();
   $("tabs-section").textContent = `— ${DATA.sections?.[state.section] || ""}`;

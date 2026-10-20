@@ -179,3 +179,12 @@ body.graph-mode .bar { display:none; }
 .favs .st { color:var(--muted); font-size:11px; flex:none; }
 .favs .rm { cursor:pointer; border:0; background:none; color:var(--muted); flex:none; }
 @media (max-width:560px) { .favs input[type=text] { width:84px; } }
+
+/* ---- on-demand take-home ---- */
+.takehome { margin:8px 0 2px; padding:10px 12px; border-left:3px solid var(--accent); background:var(--bg); border-radius:0 8px 8px 0; font-size:13px; line-height:1.5; }
+.takehome p { margin:4px 0; }
+.takehome .th-main { font-weight:600; }
+.takehome ul { margin:4px 0 4px 18px; padding:0; }
+.takehome.busy { color:var(--muted); font-style:italic; }
+.takehome.err { color:var(--danger); border-left-color:var(--danger); }
+.th-meta { color:var(--muted); font-size:11px; margin-top:6px; }
