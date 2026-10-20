@@ -1,23 +1,24 @@
 // biopapers — static client. Loads data/papers.json (+ older.json and the embeddings in the
-// background, ml.json when the ML / CS section is opened, map.json for the Map tab), ranks and
-// renders the feed.
-// Saves / upvotes / settings live in localStorage, optionally synced to a secret GitHub Gist.
+// background, ml.json when the ML / CS section is opened, map.json + favorites.json for the
+// Graph), ranks and renders the feed.
+// Saves / upvotes / favorites / settings live in localStorage, optionally synced to a secret GitHub Gist.
 
 "use strict";
 
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
 const DAY = 86400000;
 const MUST_READ = 7; // AI score (0–10) at which a paper lands in "Must read"
+const NEAR_K = 25; // each favorite pulls its 25 most similar papers into "Near favorites"
 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).
 const SPECIAL_TABS = {
   foryou: { label: "For You", color: "var(--ink)" },
   mustread: { label: "Must read", color: "#e6b422" },
-  map: { label: "Map", color: "#8fa8d6" },
+  nearfav: { label: "♥ Near favorites", color: "var(--hot)" },
   pis: { label: "PI Watch", color: "#a98fd6" },
   buzz: { label: "Buzz", color: "var(--hot)" },
   mlforyou: { label: "For You", color: "var(--ink)" },
@@ -25,8 +26,8 @@ const SPECIAL_TABS = {
   saved: { label: "Saved", color: "#f2b15c" },
 };
 const SECTION_TABS = {
-  bio: { head: ["foryou", "mustread"], tail: ["pis", "buzz", "saved", "map"] },
-  ml: { head: ["mlforyou", "mustread", "trending"], tail: ["saved", "map"] },
+  bio: { head: ["foryou", "mustread", "nearfav"], tail: ["pis", "buzz", "saved"] },
+  ml: { head: ["mlforyou", "mustread", "nearfav", "trending"], tail: ["saved"] },
 };
 const HOT_TABS = new Set(["buzz", "trending"]);
 
@@ -35,7 +36,7 @@ const WEIGHTS = {
   ai: { label: "AI relevance (Claude's 0–10 score for you)", def: 1 },
   buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
   pi: { label: "Watched PIs", def: 1 },
-  affinity: { label: "Similar to what I save / upvote", def: 0.8 },
+  affinity: { label: "Similar to my favorites, saves and upvotes", def: 0.8 },
   vote: { label: "My upvotes", def: 0.3 },
 };
 
@@ -44,11 +45,11 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {}, removed: {}, settingsAt: 0,
+  votes: {}, saved: {}, hidden: {}, favorites: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(WEIGHTS).map(([k, w]) => [k, w.def])),
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
-  lastVisit: null, prevVisit: null,
+  lastVisit: null, prevVisit: null, view: "feed", graphSection: "all", graphAround: true,
 });
 
 function loadState() {
@@ -97,10 +98,11 @@ let topicSection = new Map();
 let mlLoaded = null; // promise once ml.json is requested
 let VEC = null; // { dim, data: Int8Array, norms, index: Map(id -> row) } once vectors load
 let MAP = null, mapLoaded = null; // { ids, xy, nn, index } once map.json loads
+let favsLoaded = null; // favorites.json: favorites outside the window (on the graph, not in feeds)
 
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
-let ui = { shown: PAGE, query: "", newOnly: false, pi: null };
+let ui = { shown: PAGE, query: "", newOnly: false, pi: null, favLabel: null, graphQuery: "" };
 
 const has = (map, p) => !!(map[p.id] || (p.aliases || []).some((a) => map[a]));
 const isNew = (p) => prevVisitDay && p.added > prevVisitDay;
@@ -116,7 +118,7 @@ function addPapers(list) {
   for (const p of list) {
     if (!byId.has(p.id)) { DATA.papers.push(p); byId.set(p.id, p); }
   }
-  affinityCache = null;
+  affinityCache = nearCache = null;
 }
 
 function loadML() {
@@ -154,17 +156,21 @@ async function loadVectors() {
       norms[i] = Math.sqrt(s) || 1;
     }
     VEC = { dim, data, norms, index: new Map(meta.ids.map((id, i) => [id, i])) };
-    affinityCache = null;
+    affinityCache = nearCache = null;
     render({ keepPage: true });
   } catch { /* no embeddings yet: TF-IDF fallback */ }
 }
 
 function loadMap() {
-  mapLoaded ||= fetch("data/map.json", { cache: "no-cache" })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((m) => { if (m) MAP = { ...m, index: new Map(m.ids.map((id, i) => [id, i])) }; })
-    .catch(() => {})
-    .finally(() => { if (curTab() === "map") render({ keepPage: true }); });
+  favsLoaded ||= fetchPapers("favorites.json").then((list) => {
+    for (const p of list) if (!byId.has(p.id)) byId.set(p.id, { ...p, sections: ["bio", "ml"] });
+    affinityCache = nearCache = null;
+  });
+  mapLoaded ||= Promise.all([
+    fetch("data/map.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    favsLoaded,
+  ]).then(([m]) => { if (m) MAP = { ...m, index: new Map(m.ids.map((id, i) => [id, i])) }; })
+    .finally(() => { mapNeedsFit = true; render({ keepPage: true }); });
   return mapLoaded;
 }
 
@@ -204,10 +210,11 @@ function tokens(p) {
 }
 
 let affinityCache = null; // Map(id -> 0..1), rebuilt when the corpus or likes change
+let nearCache = null; // Map(id -> { fav, sim }) for "Near favorites", rebuilt alongside it
 
 function affinityScores() {
   if (affinityCache) return affinityCache;
-  const liked = new Set([...Object.keys(state.saved), ...Object.keys(state.votes)]);
+  const liked = new Set([...Object.keys(state.favorites), ...Object.keys(state.saved), ...Object.keys(state.votes)]);
   affinityCache = new Map();
   if (!liked.size) return affinityCache;
   if (VEC && embeddingAffinity(liked)) return affinityCache;
@@ -225,7 +232,7 @@ function affinityScores() {
   // Profile = sum of liked papers' vectors (saved snapshots cover papers aged out of the window).
   const profile = new Map();
   for (const id of liked) {
-    const p = byId.get(id) || state.saved[id]?.paper;
+    const p = byId.get(id) || state.saved[id]?.paper || state.favorites[id]?.paper;
     if (!p) continue;
     const [v, n] = vec(tokens(p));
     for (const [w, x] of v) profile.set(w, (profile.get(w) || 0) + x / n);
@@ -269,6 +276,35 @@ function embeddingAffinity(liked) {
   return true;
 }
 
+// For each favorite with an embedding, its NEAR_K most similar feed papers; a paper near several
+// favorites belongs to the closest. Map(paper id -> { fav: favorite id, sim }).
+function nearFavorites() {
+  if (nearCache) return nearCache;
+  nearCache = new Map();
+  if (!VEC) return nearCache;
+  const { dim, data, norms } = VEC;
+  for (const fid of Object.keys(state.favorites)) {
+    const f = VEC.index.get(fid);
+    if (f === undefined) continue;
+    const sims = [];
+    for (const p of DATA.papers) {
+      const r = vecRow(p);
+      if (r === undefined || r === f) continue;
+      let dot = 0; for (let j = 0; j < dim; j++) dot += data[f * dim + j] * data[r * dim + j];
+      sims.push([dot / (norms[f] * norms[r]), p.id]);
+    }
+    sims.sort((a, b) => b[0] - a[0]);
+    for (const [sim, id] of sims.slice(0, NEAR_K)) {
+      if (!(nearCache.get(id)?.sim >= sim)) nearCache.set(id, { fav: fid, sim });
+    }
+  }
+  return nearCache;
+}
+
+const favPaper = (id) => byId.get(id) || state.favorites[id]?.paper;
+const shortTitle = (t, n = 5) => { const w = (t || "").split(/\s+/); return w.slice(0, n).join(" ") + (w.length > n ? "…" : ""); };
+const favLabel = (id) => state.favorites[id]?.label || shortTitle(favPaper(id)?.title);
+
 const sectionTopics = (p) => (p.topics || []).filter((t) => topicSection.get(t) === state.section);
 
 function topicWeight(p) {
@@ -309,7 +345,7 @@ function inTab(p, tab) {
   if (tab === "mlforyou") return topicWeight(p) > 0;
   if (tab === "pis") return p.pis?.length > 0;
   if (tab === "mustread") return (p.ai?.score ?? 0) >= MUST_READ && topicWeight(p) > 0;
-  if (tab === "map") return !!MAP?.index.has(p.id);
+  if (tab === "nearfav") return nearFavorites().has(p.id);
   if (HOT_TABS.has(tab)) return (p.buzz_score || 0) > 0;
   return p.topics?.includes(tab);
 }
@@ -327,6 +363,10 @@ function visiblePapers() {
   const tab = curTab();
   let list = tab === "saved" ? savedPapers() : DATA.papers.filter((p) => inTab(p, tab) && !has(state.hidden, p));
   if (tab === "pis" && ui.pi) list = list.filter((p) => p.pis.includes(ui.pi));
+  if (tab === "nearfav" && ui.favLabel) {
+    const near = nearFavorites();
+    list = list.filter((p) => state.favorites[near.get(p.id)?.fav]?.label === ui.favLabel);
+  }
   if (ui.newOnly) list = list.filter(isNew);
   if (ui.query) {
     const q = ui.query.toLowerCase();
@@ -358,13 +398,17 @@ function render({ keepPage = false } = {}) {
   if (!tabs.includes(curTab())) setTab(SECTION_TABS[state.section].head[0]);
   const tab = curTab();
 
+  const graph = state.view === "graph";
   $("sections").innerHTML = Object.entries(DATA.sections || {}).map(([k, label]) =>
-    `<button data-section="${k}" class="${k === state.section ? "active" : ""}">${esc(label)}</button>`).join("");
+    `<button data-section="${k}" class="${!graph && k === state.section ? "active" : ""}">${esc(label)}</button>`).join("")
+    + `<button data-view="graph" class="${graph ? "active" : ""}" title="Every paper laid out by similarity, centered on your ♥ favorites">Graph</button>`;
 
   const updated = DATA.generated ? new Date(DATA.generated).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "—";
   const inSection = DATA.papers.filter((p) => (p.sections || ["bio"]).includes(state.section)).length;
   const loading = state.section === "ml" && !inSection ? "loading ML papers…" : `${inSection.toLocaleString()} papers`;
   $("sub").textContent = `${loading} · updated ${updated}`;
+  document.body.classList.toggle("graph-mode", graph);
+  if (graph) { renderGraph(); return; }
 
   const visible = (p) => !has(state.hidden, p);
   const count = (t) => t === "saved" ? Object.keys(state.saved).length
@@ -378,7 +422,6 @@ function render({ keepPage = false } = {}) {
   const sort = sortFor(tab);
   const sortLabel = (k, label) => k === "buzz" && state.section === "ml" ? "Hot" : label;
   $("sortbar").innerHTML = tab === "saved" ? `<button class="active">Recently saved</button>`
-    : tab === "map" ? ""
     : Object.entries(SORTS).map(([k, label]) =>
         `<button data-sort="${k}" class="${k === sort ? "active" : ""}">${sortLabel(k, label)}</button>`).join("");
 
@@ -389,15 +432,18 @@ function render({ keepPage = false } = {}) {
     ? [null, ...DATA.people.map((p) => p.name)].map((name) =>
         `<button class="chip ${ui.pi === name ? "active" : ""}" data-pi="${esc(name ?? "")}"
           title="${esc(DATA.people.find((x) => x.name === name)?.note || "")}">${esc(name ?? "All PIs")}</button>`).join("")
+    : tab === "nearfav"
+    ? [null, ...new Set(Object.values(state.favorites).map((f) => f.label).filter(Boolean))].map((l) =>
+        `<button class="chip ${ui.favLabel === l ? "active" : ""}" data-favlabel="${esc(l ?? "")}">${esc(l ?? "All favorites")}</button>`).join("")
     : "";
-
-  $("mapview").hidden = tab !== "map";
-  if (tab === "map") { renderMap(); return; }
 
   const list = visiblePapers();
   $("feed").innerHTML = list.length
     ? list.slice(0, ui.shown).map(card).join("")
-    : `<div class="empty">${tab === "saved" ? "Nothing saved yet — hit ☆ on a paper." : "No papers match."}</div>`;
+    : `<div class="empty">${tab === "saved" ? "Nothing saved yet — hit ☆ on a paper."
+      : tab === "nearfav" ? (Object.keys(state.favorites).length ? "Nothing yet. Papers near your favorites show up once their embeddings load, after the next build for newly added ones."
+        : "Hit ♥ on papers you love, or look up any paper in Graph, and new papers near them collect here.")
+      : "No papers match."}</div>`;
   $("more").hidden = list.length <= ui.shown;
   $("more").textContent = `Show more (${list.length - ui.shown} left)`;
 }
@@ -416,7 +462,8 @@ function card(p) {
   const lastNames = new Set((p.pis || []).map((n) => n.split(" ").pop().toLowerCase()));
   const authors = (p.authors || []).map((a) =>
     lastNames.has(a.split(" ").pop().toLowerCase()) ? `<b>${esc(a)}</b>` : esc(a)).join(", ");
-  const voted = has(state.votes, p), saved = has(state.saved, p);
+  const voted = has(state.votes, p), saved = has(state.saved, p), fav = has(state.favorites, p);
+  const near = nearCache?.get(p.id);
   const hot = [
     hf.upvotes && arxivId ? `<a class="badge hot" href="https://huggingface.co/papers/${esc(arxivId)}" target="_blank" rel="noopener" title="Hugging Face Daily Papers upvotes">▲ ${hf.upvotes} HF</a>` : "",
     b.hn ? `<a class="badge hot" href="${esc(b.hn_url)}" target="_blank" rel="noopener" title="Hacker News points">HN ${b.hn}</a>` : "",
@@ -437,6 +484,7 @@ function card(p) {
     <div class="actions">
       <button class="${voted ? "on" : ""}" data-act="vote" aria-label="Upvote" title="Upvote">▲</button>
       <button class="${saved ? "on" : ""}" data-act="save" aria-label="Save" title="Save">${saved ? "★" : "☆"}</button>
+      <button class="${fav ? "on fav" : ""}" data-act="fav" aria-label="Favorite" title="Favorite: a landmark paper the Graph and Near favorites center on">♥</button>
       <button class="hide" data-act="hide" aria-label="Hide" title="${curTab() === "saved" ? "Unsave" : "Hide"}">✕</button>
     </div>
     <div class="body">
@@ -447,6 +495,7 @@ function card(p) {
         ${hf.org ? `<span class="badge org">${esc(hf.org)}</span>` : ""}
         <span class="date">${esc(p.date)}</span>
         ${(p.pis || []).map((n) => `<span class="badge pi">PI · ${esc(n)}</span>`).join("")}
+        ${near ? `<span class="badge near" title="Near your favorite: ${esc(favPaper(near.fav)?.title)}">♥ ${esc(favLabel(near.fav))}</span>` : ""}
         ${p.ai ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
         ${hot}
         ${topics.map((t) => `<span class="badge" style="--c:${t.color}">${esc(t.label)}</span>`).join("")}
@@ -454,7 +503,7 @@ function card(p) {
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
       ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
       ${p.abstract ? `<div class="abstract">${esc(p.abstract)}</div>` : ""}
-      <div class="links">${links.join("")}<button type="button" class="linkbtn" data-act="map" title="Show on the map with its nearest neighbours">similar papers</button></div>
+      <div class="links">${links.join("")}<button type="button" class="linkbtn" data-act="map" title="Show it on the Graph with its nearest neighbours">similar papers</button></div>
     </div>
   </article>`;
 }
@@ -468,10 +517,17 @@ function toggle(name, p, value) {
   return !keys.length;
 }
 
-function snapshot(p) {
-  // Saved papers keep a copy so they survive aging out of the 30-day window.
+function snapshot(p, abstractLen = 600) {
+  // Saved papers keep a copy so they survive aging out of the 30-day window. Favorites keep a
+  // longer abstract: the build embeds them from this copy once they're out of the window.
   const { id, doi, title, authors, venue, date, url, kind, topics, pis, abstract } = p;
-  return { id, doi, title, authors, venue, date, url, kind, topics, pis, abstract: (abstract || "").slice(0, 600) };
+  return { id, doi, title, authors, venue, date, url, kind, topics, pis, abstract: (abstract || "").slice(0, abstractLen) };
+}
+
+function toggleFavorite(p) {
+  toggle("favorites", p, { ts: Date.now(), paper: snapshot(p, 1500) });
+  affinityCache = nearCache = null;
+  mapNeedsFit = true;
 }
 
 $("feed").addEventListener("click", (e) => {
@@ -480,17 +536,18 @@ $("feed").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
   if (!btn) return;
   const id = btn.closest(".paper").dataset.id;
-  const p = byId.get(id) || state.saved[id]?.paper;
+  const p = byId.get(id) || state.saved[id]?.paper || state.favorites[id]?.paper;
   if (!p) return;
   const act = btn.dataset.act;
   if (act === "map") { showOnMap(p); return; }
+  if (act === "fav") toggleFavorite(p);
   if (act === "vote") toggle("votes", p, Date.now());
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
   if (act === "hide") {
     if (curTab() === "saved") toggle("saved", p);
     else state.hidden[p.id] = Date.now();
   }
-  if (act !== "hide") affinityCache = null;
+  if (act !== "hide") affinityCache = nearCache = null;
   persist();
   render({ keepPage: true });
 });
@@ -507,15 +564,23 @@ $("sortbar").addEventListener("click", (e) => {
   state.sortByTab[curTab()] = s.dataset.sort; persist(); render();
 });
 $("sections").addEventListener("click", (e) => {
+  if (e.target.closest("[data-view=graph]")) {
+    if (state.view === "graph") return;
+    state.view = "graph"; mapNeedsFit = true; persist(); render();
+    window.scrollTo({ top: 0 });
+    return;
+  }
   const b = e.target.closest("[data-section]");
-  if (!b || b.dataset.section === state.section) return;
-  state.section = b.dataset.section; ui.pi = null; persist(); render();
+  if (!b || (b.dataset.section === state.section && state.view !== "graph")) return;
+  state.section = b.dataset.section; state.view = "feed"; ui.pi = null; persist(); render();
   if (state.section === "ml") loadML();
   window.scrollTo({ top: 0 });
 });
 $("chips").addEventListener("click", (e) => {
   const c = e.target.closest("[data-pi]");
   if (c) { ui.pi = c.dataset.pi || null; render(); }
+  const f = e.target.closest("[data-favlabel]");
+  if (f) { ui.favLabel = f.dataset.favlabel || null; render(); }
 });
 $("more").addEventListener("click", () => { ui.shown += PAGE; render({ keepPage: true }); });
 $("new-only").addEventListener("change", (e) => { ui.newOnly = e.target.checked; render(); });
@@ -525,29 +590,29 @@ $("search").addEventListener("input", (e) => {
   searchTimer = setTimeout(() => { ui.query = e.target.value.trim(); render(); }, 150);
 });
 
-// ---- map ---------------------------------------------------------------------------
-// UMAP layout of the embeddings (built by pipeline/layout.py). Dots take their topic's color;
-// ♥ marks papers you saved or upvoted, with lines to their nearest neighbours. Click a dot to
-// see that paper and the ones most like it below the map.
+// ---- graph -------------------------------------------------------------------------
+// UMAP layout of the embeddings (pipeline/layout.py), its own view next to Bio | ML / CS. Dots take
+// their topic's color; ♥ favorites are labelled hubs, and "around favorites" narrows the graph to
+// them plus the papers closest to each. Saved / upvoted papers get a ring. The lookup box finds
+// any paper, in the feed or anywhere in the literature (OpenAlex), to ♥ it. Click a dot to see that
+// paper and the ones most like it below.
 
 const mapView = { k: 1, tx: 0, ty: 0 };
 let mapSel = null, mapHover = null, mapFocus = null, mapPts = [], mapSize = { w: 0, h: 0, s: 0 };
-let mapAllLinks = false;
+let mapAllLinks = false, mapNeedsFit = true, lookupResults = [];
 
 function showOnMap(p) {
   mapFocus = p.id;
-  setTab("map"); persist(); render();
+  state.view = "graph"; persist(); render();
   window.scrollTo({ top: 0 });
 }
 
 const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const isLiked = (p) => has(state.saved, p) || has(state.votes, p);
-
-function matchesFilters(p) {
-  if (ui.newOnly && !isNew(p)) return false;
-  if (!ui.query) return true;
-  return `${p.title} ${p.authors.join(" ")} ${p.abstract} ${p.venue}`.toLowerCase().includes(ui.query.toLowerCase());
-}
+const isFav = (p) => has(state.favorites, p);
+const favOnMap = () => Object.keys(state.favorites).map((id) => MAP?.index.get(id)).filter((i) => i !== undefined);
+const repoUrl = location.hostname.endsWith(".github.io")
+  ? `https://github.com/${location.hostname.split(".")[0]}/${location.pathname.split("/")[1]}` : null;
 
 function sizeMap() {
   const c = $("map"), w = c.parentElement.clientWidth, h = Math.min(Math.round(window.innerHeight * 0.68), 680);
@@ -563,33 +628,61 @@ function sizeMap() {
 const mapBase = (i) => [(mapSize.w - mapSize.s) / 2 + MAP.xy[i][0] * mapSize.s, (mapSize.h - mapSize.s) / 2 + MAP.xy[i][1] * mapSize.s];
 const mapScreen = (i) => { const [x, y] = mapBase(i); return [x * mapView.k + mapView.tx, y * mapView.k + mapView.ty]; };
 
-function renderMap() {
+function fitMap(indexes) {
+  if (!indexes.length) { Object.assign(mapView, { k: 1, tx: 0, ty: 0 }); return; }
+  const pts = indexes.map(mapBase), xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+  const k = Math.min(12, Math.max(1, Math.min(mapSize.w / (x1 - x0 + 80), mapSize.h / (y1 - y0 + 80))));
+  Object.assign(mapView, { k, tx: mapSize.w / 2 - ((x0 + x1) / 2) * k, ty: mapSize.h / 2 - ((y0 + y1) / 2) * k });
+}
+
+function matchesGraph(p) {
+  const q = ui.graphQuery.toLowerCase();
+  return !q || `${p.title} ${(p.authors || []).join(" ")} ${p.abstract || ""} ${p.venue || ""}`.toLowerCase().includes(q);
+}
+
+function renderGraph() {
   $("more").hidden = true;
+  loadML(); // the graph spans both sections
+  for (const b of $("graph-sections").querySelectorAll("[data-gsec]")) b.classList.toggle("active", b.dataset.gsec === state.graphSection);
+  $("graph-around").checked = state.graphAround;
+  renderFavs();
   if (!MAP) {
-    $("feed").innerHTML = `<div class="empty">${mapLoaded ? "No map yet. It's built by the next daily run." : "Loading the map…"}</div>`;
+    $("graph-legend").hidden = true;
+    $("feed").innerHTML = `<div class="empty">${mapLoaded ? "No graph yet. It's built by the next daily run." : "Loading the graph…"}</div>`;
     loadMap();
     return;
   }
+  $("graph-legend").hidden = false;
   sizeMap();
+  const near = nearFavorites(), favIdx = new Set(favOnMap());
+  const around = state.graphAround && favIdx.size > 0;
+  const muted = cssVar("--muted");
+  mapPts = [];
+  MAP.ids.forEach((id, i) => {
+    const p = byId.get(id);
+    if (!p || has(state.hidden, p)) return;
+    const fav = favIdx.has(i);
+    if (!fav && state.graphSection !== "all" && !(p.sections || ["bio"]).includes(state.graphSection)) return;
+    if (around && !fav && !near.has(id)) return;
+    const topic = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t)).find(Boolean);
+    mapPts.push({ i, p, fav, near: near.get(id), color: topic?.color || (p.pis?.length ? "#a98fd6" : muted),
+                  liked: isLiked(p), dim: !matchesGraph(p) });
+  });
   if (mapFocus) {
     const i = MAP.index.get(mapFocus);
     if (i !== undefined) {
+      if (!mapPts.some((q) => q.i === i)) { state.graphAround = false; state.graphSection = "all"; mapFocus = MAP.ids[i]; return renderGraph(); }
       mapSel = i;
       mapView.k = Math.max(mapView.k, 3);
       const [x, y] = mapBase(i);
       mapView.tx = mapSize.w / 2 - x * mapView.k; mapView.ty = mapSize.h / 2 - y * mapView.k;
     }
-    mapFocus = null;
+    mapFocus = null; mapNeedsFit = false;
   }
-  const muted = cssVar("--muted");
-  mapPts = [];
-  MAP.ids.forEach((id, i) => {
-    const p = byId.get(id);
-    if (!p || !(p.sections || ["bio"]).includes(state.section) || has(state.hidden, p)) return;
-    const topic = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t))
-      .find((t) => t && (t.section || "bio") === state.section);
-    mapPts.push({ i, p, color: topic?.color || (p.pis?.length ? "#a98fd6" : muted), liked: isLiked(p), dim: !matchesFilters(p) });
-  });
+  if (mapNeedsFit) { fitMap(around ? mapPts.map((q) => q.i) : []); mapNeedsFit = false; }
+  $("graph-note").textContent = around ? `${favIdx.size} favorite${favIdx.size > 1 ? "s" : ""} and the ${mapPts.length - favIdx.size} papers closest to them`
+    : favIdx.size ? "" : "♥ papers (or look one up above) and the graph centers on them";
   drawMap();
 
   const sel = mapSel != null ? byId.get(MAP.ids[mapSel]) : null;
@@ -602,35 +695,46 @@ function drawMap() {
   const c = $("map"), ctx = c.getContext("2d"), { w, h, dpr } = mapSize;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  const ink = cssVar("--ink"), hot = cssVar("--hot");
+  const ink = cssVar("--ink"), hot = cssVar("--hot"), accent = cssVar("--accent"), card = cssVar("--card");
   const onMap = new Set(mapPts.map((q) => q.i));
   const line = (i, j, alpha, color = ink, width = 1) => {
-    if (!onMap.has(j)) return;
+    if (j === undefined || !onMap.has(j)) return;
     const [x1, y1] = mapScreen(i), [x2, y2] = mapScreen(j);
     ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = width;
     ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
   };
+  const around = state.graphAround && mapPts.some((q) => q.fav);
   for (const q of mapPts) {
     if (mapAllLinks) for (const j of MAP.nn[q.i].slice(0, 4)) line(q.i, j, 0.05);
-    else if (q.liked) for (const j of MAP.nn[q.i].slice(0, 5)) line(q.i, j, 0.35, hot);
+    if (around && q.near) line(q.i, MAP.index.get(q.near.fav), 0.3, hot);
+    else if (!around && q.fav) for (const j of MAP.nn[q.i].slice(0, 6)) line(q.i, j, 0.4, hot);
   }
   if (mapSel != null && onMap.has(mapSel)) for (const j of MAP.nn[mapSel]) line(mapSel, j, 0.85, ink, 1.5);
 
-  const r = Math.min(4, 2 + Math.log2(mapView.k));
+  const r = Math.min(around ? 5 : 4, 2 + Math.log2(mapView.k) + (around ? 1 : 0));
   for (const q of mapPts) {
-    if (q.liked) continue;
+    if (q.fav) continue;
     const [x, y] = mapScreen(q.i);
     if (x < -5 || y < -5 || x > w + 5 || y > h + 5) continue;
-    ctx.globalAlpha = q.dim ? 0.08 : 0.75; ctx.fillStyle = q.color;
+    ctx.globalAlpha = q.dim ? 0.08 : 0.8; ctx.fillStyle = q.color;
     ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.fill();
+    if (q.liked && !q.dim) {
+      ctx.globalAlpha = 1; ctx.strokeStyle = accent; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, r + 2.5, 0, 2 * Math.PI); ctx.stroke();
+    }
   }
-  ctx.font = "15px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.textBaseline = "middle";
   for (const q of mapPts) {
-    if (!q.liked) continue;
+    if (!q.fav) continue;
     const [x, y] = mapScreen(q.i);
-    ctx.globalAlpha = q.dim ? 0.25 : 1; ctx.fillStyle = hot; ctx.fillText("♥", x, y);
+    ctx.globalAlpha = q.dim ? 0.3 : 1;
+    ctx.font = "20px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.fillStyle = hot; ctx.fillText("♥", x, y);
+    const label = favLabel(q.p.id);
+    ctx.font = "600 12px system-ui, sans-serif"; ctx.textAlign = "left";
+    ctx.lineWidth = 3; ctx.strokeStyle = card; ctx.strokeText(label, x + 12, y);
+    ctx.fillStyle = ink; ctx.fillText(label, x + 12, y);
   }
-  for (const [i, ring] of [[mapHover, 7], [mapSel, 9]]) {
+  for (const [i, ring] of [[mapHover, 8], [mapSel, 11]]) {
     if (i == null || !onMap.has(i)) continue;
     const [x, y] = mapScreen(i);
     ctx.globalAlpha = 1; ctx.strokeStyle = ink; ctx.lineWidth = 2;
@@ -640,13 +744,160 @@ function drawMap() {
 }
 
 function mapHit(x, y) {
-  let best = null, bestD = 10 * 10;
+  let best = null, bestD = 12 * 12;
   for (const q of mapPts) {
-    const [px, py] = mapScreen(q.i), d = (px - x) ** 2 + (py - y) ** 2;
+    const [px, py] = mapScreen(q.i), d = (px - x) ** 2 + (py - y) ** 2 - (q.fav ? 40 : 0);
     if (d < bestD) { bestD = d; best = q; }
   }
   return best;
 }
+
+// ---- favorites panel ----
+
+function renderFavs() {
+  const favs = Object.entries(state.favorites).sort((a, b) => b[1].ts - a[1].ts);
+  const pending = favs.some(([id]) => MAP && !MAP.index.has(id));
+  const notes = [
+    pending && `Newly added favorites join the graph after the next daily build${repoUrl ? ` (or <a href="${repoUrl}/actions/workflows/daily.yml" target="_blank" rel="noopener">run it now</a>)` : ""}.`,
+    favs.length && !sync.token && "Turn on Sync in ⚙︎ so the daily build can see your favorites.",
+  ].filter(Boolean);
+  $("favs").innerHTML = `
+    <h3>♥ Favorites <span class="n">${favs.length}</span></h3>
+    <p class="hint">Landmark papers the graph centers on. Give them a label and new papers near them are
+      grouped under it in the ♥ Near favorites tab. ${notes.join(" ")}</p>
+    ${favs.length ? `<ul>${favs.map(([id, f]) => {
+      const p = favPaper(id), on = MAP?.index.has(id);
+      return `<li data-fav="${esc(id)}">
+        <button type="button" class="fav-title" data-favact="show" ${on ? "" : "disabled"} title="${on ? "Show on the graph" : "Joins the graph after the next build"}">${esc(p?.title || id)}</button>
+        <input type="text" data-favact="label" value="${esc(f.label || "")}" placeholder="label" aria-label="Label">
+        <span class="st">${on ? "" : "after next build"}</span>
+        <button type="button" class="rm" data-favact="remove" aria-label="Remove favorite" title="Remove">✕</button>
+      </li>`;
+    }).join("")}</ul>` : ""}`;
+}
+
+$("favs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-favact]"), id = b?.closest("[data-fav]")?.dataset.fav;
+  if (!id) return;
+  if (b.dataset.favact === "show") { mapFocus = id; render({ keepPage: true }); }
+  if (b.dataset.favact === "remove") {
+    forget("favorites", [id]); affinityCache = nearCache = null; mapNeedsFit = true;
+    persist(); render({ keepPage: true });
+  }
+});
+$("favs").addEventListener("change", (e) => {
+  if (e.target.dataset.favact !== "label") return;
+  const id = e.target.closest("[data-fav]").dataset.fav, f = state.favorites[id];
+  if (!f) return;
+  const label = e.target.value.trim();
+  state.favorites[id] = { ...f, ts: Date.now(), ...(label ? { label } : {}) };
+  if (!label) delete state.favorites[id].label;
+  persist(); drawMap();
+});
+
+// ---- lookup: any paper, from the feed or OpenAlex ----
+
+// "10.1101/2024.01.01.123v2" / "https://doi.org/…" / "arXiv:2401.01234v3" / an arxiv.org URL -> our paper id.
+function paperRef(q) {
+  const ax = q.match(/(?:arxiv\.org\/(?:abs|pdf)\/|arxiv:\s*|^)(\d{4}\.\d{4,5})(?:v\d+)?(?:\.pdf)?$/i);
+  if (ax) return `10.48550/arxiv.${ax[1]}`;
+  const doi = q.match(/10\.\d{4,9}\/[^\s"'<>?#]+/);
+  if (!doi) return null;
+  let d = doi[0].toLowerCase().replace(/[.,;)]+$/, "");
+  if (d.startsWith("10.1101/")) d = d.replace(/v\d+$/, ""); // bioRxiv version suffix, as the pipeline does
+  return d;
+}
+
+function fromOpenAlex(w) {
+  const inv = w.abstract_inverted_index, pos = [];
+  if (inv) for (const [word, idxs] of Object.entries(inv)) for (const i of idxs) pos[i] = word;
+  const doi = w.doi ? w.doi.replace(/^https?:\/\/doi\.org\//, "").toLowerCase() : null;
+  const id = doi?.startsWith("10.1101/") ? doi.replace(/v\d+$/, "") : doi || w.id;
+  const authors = (w.authorships || []).map((a) => a.author?.display_name).filter(Boolean);
+  const src = w.primary_location?.source?.display_name || "";
+  return {
+    id, doi, title: w.title || w.display_name || "(untitled)",
+    authors: authors.length > 13 ? [...authors.slice(0, 10), "…", ...authors.slice(-3)] : authors,
+    abstract: pos.filter(Boolean).join(" "), date: w.publication_date || String(w.publication_year || ""),
+    venue: /arxiv/i.test(src) ? "arXiv" : /biorxiv/i.test(src) ? "bioRxiv" : /medrxiv/i.test(src) ? "medRxiv" : src || "Other",
+    kind: w.type === "preprint" ? "preprint" : "article",
+    url: doi ? `https://doi.org/${doi}` : w.primary_location?.landing_page_url || w.id,
+  };
+}
+
+let lookupSeq = 0;
+async function lookup(q) {
+  const seq = ++lookupSeq, ref = paperRef(q), lq = q.toLowerCase();
+  const local = ref && byId.has(ref) ? [byId.get(ref)]
+    : [...byId.values()].filter((p) => p.title.toLowerCase().includes(lq)).slice(0, 6);
+  lookupResults = local.map((p) => ({ p, local: true }));
+  renderLookup(q.length >= 3 ? "searching the literature…" : "");
+  if (q.length < 3) return;
+  const select = "id,doi,title,display_name,publication_date,publication_year,type,authorships,primary_location,abstract_inverted_index";
+  const url = ref
+    ? `https://api.openalex.org/works/doi:${encodeURIComponent(ref)}?select=${select}`
+    : `https://api.openalex.org/works?search=${encodeURIComponent(q)}&per-page=8&select=${select}`;
+  let remote = [];
+  try {
+    const res = await fetch(url);
+    const body = res.ok ? await res.json() : null;
+    remote = (body?.results || (body?.id ? [body] : [])).map(fromOpenAlex);
+  } catch { /* offline: local results only */ }
+  if (seq !== lookupSeq) return;
+  const seen = new Set(lookupResults.map((r) => r.p.id));
+  for (const p of remote) if (!seen.has(p.id)) { seen.add(p.id); lookupResults.push(byId.has(p.id) ? { p: byId.get(p.id), local: true } : { p, local: false }); }
+  renderLookup(lookupResults.length ? "" : "No papers found.");
+}
+
+function renderLookup(status) {
+  const row = (r, i) => {
+    const p = r.p, fav = has(state.favorites, p), on = MAP?.index.has(p.id);
+    const meta = [p.venue, (p.date || "").slice(0, 4), (p.authors || []).filter((a) => a !== "…").slice(0, 3).join(", ")].filter(Boolean).join(" · ");
+    return `<li data-lk="${i}">
+      <button type="button" class="heart ${fav ? "on" : ""}" data-lkact="fav" aria-label="${fav ? "Remove favorite" : "Add to favorites"}" title="${fav ? "Remove favorite" : "Add to favorites"}">♥</button>
+      <div class="lk-body"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a><div class="lk-meta">${esc(meta)}</div></div>
+      ${on ? `<button type="button" class="lk-show" data-lkact="show">show</button>` : ""}
+    </li>`;
+  };
+  const local = lookupResults.map((r, i) => [r, i]).filter(([r]) => r.local);
+  const remote = lookupResults.map((r, i) => [r, i]).filter(([r]) => !r.local);
+  $("lookup-results").hidden = !ui.graphQuery;
+  $("lookup-results").innerHTML = (local.length ? `<div class="lk-sec">In your feed</div><ul>${local.map(([r, i]) => row(r, i)).join("")}</ul>` : "")
+    + (remote.length ? `<div class="lk-sec">From the literature · OpenAlex</div><ul>${remote.map(([r, i]) => row(r, i)).join("")}</ul>` : "")
+    + (status ? `<div class="lk-status">${esc(status)}</div>` : "");
+}
+
+let lookupTimer;
+$("lookup").addEventListener("input", (e) => {
+  clearTimeout(lookupTimer);
+  ui.graphQuery = e.target.value.trim();
+  if (!ui.graphQuery) { lookupResults = []; renderLookup(""); }
+  lookupTimer = setTimeout(() => {
+    if (MAP) { for (const q of mapPts) q.dim = !matchesGraph(q.p); drawMap(); }
+    if (ui.graphQuery) lookup(ui.graphQuery);
+  }, 300);
+});
+document.addEventListener("click", (e) => {
+  // A ♥ in the results re-renders the list, detaching the clicked button: that's not an outside click.
+  if (e.target.isConnected && !e.target.closest(".lookup-box")) $("lookup-results").hidden = true;
+});
+$("lookup").addEventListener("focus", () => { if (ui.graphQuery) $("lookup-results").hidden = false; });
+$("lookup").addEventListener("keydown", (e) => { if (e.key === "Escape") $("lookup-results").hidden = true; });
+$("lookup-results").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-lkact]"), r = lookupResults[b?.closest("[data-lk]")?.dataset.lk];
+  if (!r) return;
+  if (b.dataset.lkact === "show") { mapFocus = r.p.id; render({ keepPage: true }); return; }
+  toggleFavorite(r.p);
+  persist(); renderLookup(""); render({ keepPage: true });
+});
+$("graph-sections").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-gsec]");
+  if (!b) return;
+  state.graphSection = b.dataset.gsec; mapNeedsFit = true; persist(); render({ keepPage: true });
+});
+$("graph-around").addEventListener("change", (e) => {
+  state.graphAround = e.target.checked; mapNeedsFit = true; persist(); render({ keepPage: true });
+});
 
 (function wireMap() {
   const c = $("map"), tip = $("map-tip"), pointers = new Map();
@@ -682,7 +933,7 @@ function mapHit(x, y) {
     if (i !== mapHover) { mapHover = i; drawMap(); }
     tip.hidden = !q;
     if (q) {
-      tip.textContent = q.p.title;
+      tip.textContent = q.near ? `${q.p.title}  ·  near ♥ ${favLabel(q.near.fav)}` : q.p.title;
       tip.style.left = `${Math.min(x + 14, mapSize.w - 260)}px`; tip.style.top = `${y + 14}px`;
     }
   });
@@ -700,13 +951,13 @@ function mapHit(x, y) {
   c.addEventListener("pointercancel", (e) => { pointers.delete(e.pointerId); drag = null; pinch = null; });
   c.addEventListener("pointerleave", () => { tip.hidden = true; if (mapHover != null) { mapHover = null; drawMap(); } });
   $("map-links").addEventListener("change", (e) => { mapAllLinks = e.target.checked; drawMap(); });
-  $("map-reset").addEventListener("click", () => { Object.assign(mapView, { k: 1, tx: 0, ty: 0 }); drawMap(); });
+  $("map-reset").addEventListener("click", () => { mapNeedsFit = true; render({ keepPage: true }); });
   window.addEventListener("resize", () => {
-    if (curTab() !== "map" || !MAP) return;
-    // The old pan/zoom is meaningless at the new size: re-centre on the selection, or reset.
+    if (state.view !== "graph" || !MAP) return;
+    // The old pan/zoom is meaningless at the new size: re-centre on the selection, or re-fit.
     if (mapSel != null) mapFocus = MAP.ids[mapSel];
-    else Object.assign(mapView, { k: 1, tx: 0, ty: 0 });
-    renderMap();
+    else mapNeedsFit = true;
+    renderGraph();
   });
 })();
 
@@ -783,7 +1034,7 @@ $("import-file").addEventListener("change", async (e) => {
     state = { ...state, ...incoming,
       votes: { ...state.votes, ...incoming.votes }, saved: { ...state.saved, ...incoming.saved },
       hidden: { ...state.hidden, ...incoming.hidden } };
-    persist(); affinityCache = null; renderSettings(); render();
+    persist(); affinityCache = nearCache = null; renderSettings(); render();
   } catch (err) { alert(`Couldn't import: ${err.message}`); }
   e.target.value = "";
 });
@@ -802,7 +1053,7 @@ $("reset").addEventListener("click", () => {
   if (!confirm(`Clear all saves, upvotes and settings${sync.token ? " on every synced device" : " in this browser"}?`)) return;
   for (const m of SYNC_MAPS) forget(m, Object.keys(state[m]));
   state = { ...defaults(), removed: state.removed, lastVisit: state.lastVisit };
-  persist(); affinityCache = null; renderSettings(); render();
+  persist(); affinityCache = nearCache = null; renderSettings(); render();
 });
 
 // ---- sync (secret GitHub Gist) ---------------------------------------------------------
@@ -903,7 +1154,7 @@ async function syncNow() {
     }
     saveSyncConfig();
     Object.assign(syncStatus, { at: Date.now(), error: null });
-    if (syncedJSON !== before) { affinityCache = null; if (DATA.generated) render({ keepPage: true }); }
+    if (syncedJSON !== before) { affinityCache = nearCache = null; if (DATA.generated) render({ keepPage: true }); }
   } catch (err) {
     syncStatus.error = err.message;
     syncedJSON = null; // so the next change retries the push

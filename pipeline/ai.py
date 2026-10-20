@@ -1,8 +1,8 @@
 """AI relevance scores + TL;DRs from Claude, via the Message Batches API (half price).
 
 Each unscored paper gets p["ai"] = {"score": 0-10, "tldr": "...", "why": "..."}, written for the
-reader described in config/profile.md (plus papers they saved / upvoted, if Gist sync is on and
-BIOPAPERS_GIST_ID is set). Papers go out PER_REQUEST to a request. A build waits up to
+reader described in config/profile.md (plus their favorites and the papers they saved /
+upvoted, if Gist sync is on and BIOPAPERS_GIST_ID is set). Papers go out PER_REQUEST to a request. A build waits up to
 `wait_min` minutes for its batch; one that hasn't finished by then is recorded in
 site/data/ai_pending.json and collected by the next build instead of being resubmitted.
 
@@ -13,13 +13,12 @@ import json
 import os
 import time
 
-from .common import CONFIG_DIR, client as http_client
+from .common import CONFIG_DIR
 
 MODEL = "claude-haiku-5-5"
 PER_REQUEST = 20
 MAX_ABSTRACT = 1200
 MAX_LIKED = 40
-GIST_FILE = "biopapers-state.json"
 # Batch rates for claude-haiku-5-5, $/MTok (half the standard $0.10 in / $0.50 out).
 PRICE = {"input": 0.05, "output": 0.25, "cache_read": 0.005, "cache_write": 0.0625}
 
@@ -48,31 +47,24 @@ def load_profile() -> str:
     return "\n".join(line for line in text.splitlines() if not line.startswith("#")).strip()
 
 
-def liked_titles(gist_id: str | None, by_id: dict[str, dict], log) -> list[str]:
-    """Titles of the reader's saved + upvoted papers, newest first, from their sync gist."""
-    if not gist_id:
-        return []
-    try:
-        with http_client() as c:
-            f = c.get(f"https://api.github.com/gists/{gist_id}").raise_for_status().json()["files"][GIST_FILE]
-            text = c.get(f["raw_url"]).raise_for_status().text if f.get("truncated") else f["content"]
-        state = json.loads(text)
-    except Exception as ex:
-        log(f"  ai: couldn't read the sync gist ({ex}) — scoring without liked examples")
-        return []
-    liked = [(s.get("ts", 0), (by_id.get(pid) or s.get("paper") or {}).get("title"))
-             for pid, s in state.get("saved", {}).items()]
-    liked += [(ts, by_id[pid]["title"]) for pid, ts in state.get("votes", {}).items() if pid in by_id]
-    seen, out = set(), []
-    for _, title in sorted(liked, key=lambda x: -x[0]):
-        if title and title not in seen:
-            seen.add(title)
+def titles(entries: dict, by_id: dict[str, dict], limit: int) -> list[str]:
+    """Newest-first titles for synced {id: ts | {ts, paper}} entries."""
+    rows = [(e if isinstance(e, (int, float)) else e.get("ts", 0),
+             (by_id.get(pid) or (e.get("paper") if isinstance(e, dict) else None) or {}).get("title"))
+            for pid, e in entries.items()]
+    out = []
+    for _, title in sorted(rows, key=lambda x: -x[0]):
+        if title and title not in out:
             out.append(title)
-    return out[:MAX_LIKED]
+    return out[:limit]
 
 
-def system_prompt(liked: list[str]) -> str:
+def system_prompt(favorites: list[str], liked: list[str]) -> str:
     text = f"{INSTRUCTIONS}\n\n<reader_profile>\n{load_profile()}\n</reader_profile>"
+    if favorites:
+        text += ("\n\n<their_favorite_papers>\nPapers they picked as defining their interests — the strongest "
+                 "signal of what they care about:\n" + "\n".join(f"- {t}" for t in favorites)
+                 + "\n</their_favorite_papers>")
     if liked:
         text += ("\n\n<papers_they_saved_or_upvoted>\n" + "\n".join(f"- {t}" for t in liked)
                  + "\n</papers_they_saved_or_upvoted>")
@@ -132,8 +124,9 @@ def collect(client, batch: dict, by_id: dict[str, dict], log) -> None:
         f"{usage['input'] + usage['cache_read'] + usage['cache_write']:,} in / {usage['output']:,} out tokens ≈ ${cost:.2f}")
 
 
-def run(papers: list[dict], pending: list[dict], wait_min: float, log) -> list[dict]:
-    """Score `papers` in place. Returns the batches still running (for ai_pending.json)."""
+def run(papers: list[dict], pending: list[dict], wait_min: float, log, synced: dict | None = None) -> list[dict]:
+    """Score `papers` in place. `synced` is the site's synced state (favorites, saves, votes).
+    Returns the batches still running (for ai_pending.json)."""
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log("  ai: skipped (no ANTHROPIC_API_KEY)")
         return pending
@@ -156,7 +149,11 @@ def run(papers: list[dict], pending: list[dict], wait_min: float, log) -> list[d
         log(f"  ai: nothing new to score ({len(still)} batch(es) still running)")
         return still
 
-    system = system_prompt(liked_titles(os.environ.get("BIOPAPERS_GIST_ID"), by_id, log))
+    synced = synced or {}
+    favorites = titles(synced.get("favorites") or {}, by_id, MAX_LIKED)
+    liked = [t for t in titles({**(synced.get("votes") or {}), **(synced.get("saved") or {})}, by_id, MAX_LIKED)
+             if t not in favorites]
+    system = system_prompt(favorites, liked)
     batch = submit(client, todo, system)
     log(f"  ai: submitted {len(todo)} papers as batch {batch['id']} ({len(batch['requests'])} requests)")
     deadline = time.time() + wait_min * 60

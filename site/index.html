@@ -34,16 +34,27 @@
   </div>
 
   <div class="wrap">
-    <section id="mapview" class="mapview" hidden>
+    <section id="graphview" class="graphview">
+      <div class="graph-tools">
+        <div class="lookup-box">
+          <input type="search" id="lookup" placeholder="Look up any paper (title, DOI or arXiv ID) to ♥ it" aria-label="Look up a paper" autocomplete="off">
+          <div id="lookup-results" class="lookup-results" hidden></div>
+        </div>
+        <div class="sortbar" id="graph-sections" role="group" aria-label="Section">
+          <button data-gsec="all">All</button><button data-gsec="bio">Bio</button><button data-gsec="ml">ML / CS</button>
+        </div>
+        <label class="newonly" title="Only your favorites and the papers closest to each"><input type="checkbox" id="graph-around"> around favorites</label>
+      </div>
       <div class="map-wrap">
-        <canvas id="map" aria-label="Map of papers by similarity"></canvas>
+        <canvas id="map" aria-label="Graph of papers by similarity"></canvas>
         <div id="map-tip" class="map-tip" hidden></div>
       </div>
-      <div class="map-bar">
-        <span><span class="heart">♥</span> saved or upvoted · scroll or pinch to zoom, drag to pan · search dims what doesn't match</span>
+      <div class="map-bar" id="graph-legend">
+        <span><span class="heart">♥</span> favorite · <span class="ring">○</span> saved or upvoted · scroll or pinch to zoom, drag to pan · <span id="graph-note"></span></span>
         <label><input type="checkbox" id="map-links"> all links</label>
-        <button type="button" id="map-reset">reset view</button>
+        <button type="button" id="map-reset">fit view</button>
       </div>
+      <div id="favs" class="favs"></div>
     </section>
     <main id="feed" aria-live="polite"></main>
     <div class="more"><button id="more" hidden>Show more</button></div>

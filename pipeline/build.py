@@ -12,6 +12,7 @@ Outputs:
     site/data/ml.json       ML-only papers for the ML / CS section (loaded when you open it)
     site/data/vectors.*     int8 title+abstract embeddings for every paper above (see embed.py)
     site/data/map.json      2D UMAP layout + nearest-neighbour graph of those (see layout.py)
+    site/data/favorites.json   ♥ favorites outside the window, so they're on the map (see favorites.py)
     site/data/ai_pending.json   AI-scoring batches still running, collected next build (see ai.py)
     site/alerts.xml         RSS feed of PI-watchlist + buzzing papers (subscribe for alerts)
     archive/papers-YYYY-MM.jsonl.gz   every paper seen, untruncated and never pruned (see archive.py)
@@ -20,12 +21,13 @@ Outputs:
 import argparse
 import datetime as dt
 import json
+import os
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .common import ROOT, client, load_config, strip_label, title_key, today
-from . import ai, archive, embed, layout
+from .common import ROOT, client, load_config, read_gist_state, strip_label, title_key, today
+from . import ai, archive, embed, favorites, layout
 from .sources import buzz, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
@@ -308,12 +310,23 @@ def main() -> None:
     final = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        synced = read_gist_state(os.environ.get("BIOPAPERS_GIST_ID"))
+    except Exception as ex:
+        log(f"! couldn't read the sync gist: {ex}")
+        synced = {}
+    in_window = {p["id"]: p for p in final}
+    for p in final:
+        for a in p.get("aliases", []):
+            in_window.setdefault(a, p)
+    extras = favorites.load(synced, in_window, log)
+    (OUT_DIR / "favorites.json").write_text(json.dumps({"papers": extras}, ensure_ascii=False, separators=(",", ":")))
     if "embed" in only:
-        embed.run(final, embed.load_previous(args.previous), OUT_DIR, log)
+        embed.run(final + extras, embed.load_previous(args.previous), OUT_DIR, log)
         layout.run(OUT_DIR, log)
     pending = (fetch_json(args.previous, "ai_pending.json") or {}).get("batches", [])
     if "ai" in only:
-        pending = ai.run(final, pending, args.ai_wait, log)
+        pending = ai.run(final, pending, args.ai_wait, log, synced)
         for p in final:  # final holds trimmed copies; the archive reads `papers`
             if "ai" in p:
                 papers[p["id"]]["ai"] = p["ai"]

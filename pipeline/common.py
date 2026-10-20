@@ -2,6 +2,7 @@
 
 import datetime as dt
 import html
+import json
 import os
 import re
 import time
@@ -135,3 +136,18 @@ def make_paper(*, doi: str | None, title: str, authors: list[str], abstract: str
         "category": (category or "").strip().lower(),
         **extra,
     }
+
+
+GIST_FILE = "biopapers-state.json"
+
+
+def read_gist_state(gist_id: str | None) -> dict:
+    """The site's synced state (saves, votes, favorites...) from the reader's sync gist, or {}.
+    Secret gists are readable by ID without auth."""
+    if not gist_id:
+        return {}
+    with client() as c:
+        f = get(c, f"https://api.github.com/gists/{gist_id}").json()["files"].get(GIST_FILE)
+        if not f:
+            return {}
+        return json.loads(get(c, f["raw_url"]).text if f.get("truncated") else f["content"])

@@ -70,8 +70,15 @@ export/import of your data, saved → BibTeX.
   collected by the next day's build.
 - **Embeddings** — bge-small-en-v1.5 over title + abstract, computed on the Actions runner (free).
   They power "Similar to what I save / upvote" in For You and the **similar papers** button.
-- **Map** — a UMAP layout of the embeddings, colored by topic. ♥ marks what you saved or upvoted,
-  with lines to their nearest neighbours; click any dot to see it and the 20 papers most like it.
+- **Graph** — its own view next to Bio | ML / CS: a UMAP layout of the embeddings, colored by topic.
+  ♥ favorites are labelled hubs; "around favorites" narrows it to them plus the 25 papers closest to
+  each. Click any dot to see it and the 20 papers most like it.
+- **♥ Favorites** — landmark papers, separate from saves. ♥ any card, or look up *any* paper in the
+  Graph's search box (your feed, or the whole literature via OpenAlex, by title / DOI / arXiv ID).
+  They sync through the gist, never age out, steer For You and the AI scorer, and give each label its
+  own group in the **♥ Near favorites** tab, which works like a topic defined by example papers.
+  Favorites from outside the feed join the graph on the next daily build (needs Gist sync +
+  `BIOPAPERS_GIST_ID`); they're published in `data/favorites.json` like the rest of the site's data.
 
 ## Run locally
 
