@@ -11,7 +11,7 @@ const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export
 const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
 const DAY = 86400000;
-const MUST_READ = 7; // AI score (0–10) at which a paper lands in "Must read"
+const MUST_READ = 6; // AI score (0–10) at which a paper lands in "Must read"
 const NEAR_K = 25; // each favorite pulls its 25 most similar papers into "Near favorites"
 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).

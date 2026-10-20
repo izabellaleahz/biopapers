@@ -64,7 +64,7 @@ export/import of your data, saved → BibTeX.
 
 - **Must read** — every paper gets a 0–10 relevance score, a one-line TL;DR and a few words on
   why it matters, from Claude Haiku 5.5 reading the title + abstract against `config/profile.md`
-  (plus your saved / upvoted papers, if `BIOPAPERS_GIST_ID` is set). Papers scoring ≥ 7 land in the
+  (plus your saved / upvoted papers, if `BIOPAPERS_GIST_ID` is set). Papers scoring ≥ 6 land in the
   Must read tab, and the score feeds the For You ranking ("AI relevance" weight in ⚙︎). Uses
   `ANTHROPIC_API_KEY` (Message Batches API, half price, ~$2/month) or else `OPENROUTER_API_KEY`
   (`anthropic/claude-haiku-5.5`, direct calls, ~$3–4/month, at most 3,000 papers per build).
