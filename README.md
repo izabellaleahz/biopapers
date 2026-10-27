@@ -137,3 +137,8 @@ committing data. Optional repo secrets/variables:
 - **alphaXiv** has no public API — we link to each paper's alphaXiv page rather than
   pulling its votes/comments. "Trending" uses Hugging Face Daily Papers upvotes instead.
 - **Keyword tagging** is rule-based; tune `config/topics.yaml` when a tab is too loose or too strict.
+  Journal papers no rule tags aren't simply dropped: they stay if their AI score is ≥ 3 (For You shows
+  them from 4), and get a topic tab when most of their nearest tagged papers share one.
+- **Journal coverage:** RSS feeds only list a journal's newest items (8 for every Nature journal), so
+  busy journals are also pulled from OpenAlex by ISSN (complete, ~1–3 days late). Cell Press stays
+  RSS-only: OpenAlex lists it under issue dates, weeks late.

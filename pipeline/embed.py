@@ -56,7 +56,8 @@ def load_previous(base: str | None) -> dict[str, np.ndarray]:
     return dict(zip(meta["ids"], rows))
 
 
-def run(papers: list[dict], previous: dict[str, np.ndarray], out_dir: Path, log) -> None:
+def vectors(papers: list[dict], previous: dict[str, np.ndarray], log) -> dict[str, np.ndarray]:
+    """id -> int8 vector for every paper, embedding only the ones `previous` doesn't have."""
     todo = [p for p in papers if p["id"] not in previous]
     vecs = dict(previous)
     if todo:
@@ -69,7 +70,11 @@ def run(papers: list[dict], previous: dict[str, np.ndarray], out_dir: Path, log)
         todo.sort(key=lambda p: len(text_of(p)))
         fresh = np.array(list(model.embed([text_of(p) for p in todo], batch_size=64)), dtype=np.float32)
         vecs.update(zip((p["id"] for p in todo), quantize(fresh)))
+    log(f"  embed: {len(todo)} new, {len(papers) - len(todo)} reused")
+    return vecs
+
+
+def write(papers: list[dict], vecs: dict[str, np.ndarray], out_dir: Path) -> None:
     ids = [p["id"] for p in papers]
     (out_dir / "vectors.bin").write_bytes(np.stack([vecs[i] for i in ids]).tobytes() if ids else b"")
     (out_dir / "vectors.json").write_text(json.dumps({"model": MODEL, "dim": DIM, "ids": ids}, separators=(",", ":")))
-    log(f"  embed: {len(todo)} new, {len(ids) - len(todo)} reused")

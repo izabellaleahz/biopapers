@@ -365,7 +365,8 @@ function tabInfo(slug) {
 
 function inTab(p, tab) {
   if (!(p.sections || ["bio"]).includes(state.section)) return false;
-  if (tab === "foryou") return (sectionTopics(p).length || p.pis?.length) && topicWeight(p) > 0;
+  // Journal papers that fit no topic tab still belong in For You when Claude rates them relevant.
+  if (tab === "foryou") return (sectionTopics(p).length || p.pis?.length || (p.ai?.score ?? 0) >= 4) && topicWeight(p) > 0;
   if (tab === "mlforyou") return topicWeight(p) > 0;
   if (tab === "pis") return p.pis?.length > 0;
   if (HOT_TABS.has(tab)) return (p.buzz_score || 0) > 0;
@@ -533,7 +534,7 @@ function card(p) {
         ${near ? `<span class="badge near" title="Near your favorite: ${esc(favPaper(near.fav)?.title)}">♥ ${esc(favLabel(near.fav))}</span>` : ""}
         ${typeof p.ai?.score === "number" ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
         ${hot}
-        ${topics.map((t) => `<span class="badge" style="--c:${t.color}">${esc(t.label)}</span>`).join("")}
+        ${topics.map((t) => `<span class="badge" style="--c:${t.color}"${p.tagged_by ? ` title="Tagged from similar papers (no keyword matched)"` : ""}>${esc(t.label)}</span>`).join("")}
       </div>
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
       ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}

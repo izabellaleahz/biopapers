@@ -14,6 +14,7 @@ Outputs:
     site/data/map.json      2D UMAP layout + nearest-neighbour graph of those (see layout.py)
     site/data/favorites.json   ♥ favorites outside the window, so they're on the map (see favorites.py)
     site/data/ai_pending.json   AI-scoring batches still running, collected next build (see ai.py)
+    site/data/ai_dropped.json   scores of untagged journal papers that didn't make the cut (not re-scored)
     site/alerts.xml         RSS feed of PI-watchlist + buzzing papers (subscribe for alerts)
     archive/papers-YYYY-MM.jsonl.gz   every paper seen, untruncated and never pruned (see archive.py)
 """
@@ -27,7 +28,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .common import ROOT, client, load_config, read_gist_state, strip_label, title_key, today
-from . import ai, archive, embed, favorites, layout
+from . import ai, archive, embed, favorites, layout, tagging
 from .sources import buzz, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
@@ -42,6 +43,8 @@ MAX_AUTHORS = 13  # keep first 10 + last 3 (PIs are usually last)
 MAX_ABSTRACT = 1500
 MAX_ABSTRACT_ML = 900
 PI_KEEP_DAYS = 180  # watched-PI papers stick around longer than the general feed
+OPENALEX_LOOKBACK = 10  # days; OpenAlex lists journal papers 1-3 days after they're out
+KEEP_UNTAGGED_SCORE = 3  # a journal paper no rule tagged stays if its AI score is at least this
 
 
 def log(msg: str) -> None:
@@ -109,8 +112,8 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger) 
 
     if "rss" in only:
         papers += journals.fetch_all_feeds(sources.get("rss", {}), log)
-    if "openalex" in only:
-        papers += journals.fetch_issn_journals(sources.get("openalex", {}), days, log)
+    if "openalex" in only:  # OpenAlex indexes a few days late: look further back (repeats merge by DOI)
+        papers += journals.fetch_issn_journals(sources.get("openalex", {}), max(days, OPENALEX_LOOKBACK), log)
 
     if "search" in only:
         for t in load_config("topics")["topics"]:
@@ -222,18 +225,34 @@ def sections_for(p: dict, tagger: Tagger, ml_cats: tuple) -> list[str]:
     return sorted(secs)
 
 
-def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: dict) -> list[dict]:
+def trim(p: dict, tagger: Tagger) -> dict:
+    """The copy that ships to the site: long author lists and abstracts cut (the archive keeps the full record)."""
+    p = {**p}
+    if len(p["authors"]) > MAX_AUTHORS:
+        p["n_authors"] = len(p["authors"])
+        middle = [a for a in p["authors"][10:-3] if tagger.is_pi_author(a, p["pis"])]
+        p["authors"] = p["authors"][:10] + ["…", *middle] + p["authors"][-3:]
+    # ML-only papers get a shorter abstract (most have an HF TL;DR, and there are a lot of them).
+    cap = MAX_ABSTRACT_ML if p["sections"] == ["ml"] else MAX_ABSTRACT
+    p["abstract"] = strip_label(p["abstract"])[:cap]
+    return p
+
+
+def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: dict) -> tuple[list[dict], list[dict]]:
+    """(papers for the site, journal papers in the window that no rule tagged — see tagging.by_similarity)."""
     cutoff = (today() - dt.timedelta(days=keep_days)).isoformat()
     pi_cutoff = (today() - dt.timedelta(days=PI_KEEP_DAYS)).isoformat()
     firehose_cutoff = (today() - dt.timedelta(days=ml_cfg.get("firehose_days", 3))).isoformat()
     ml_cats = tuple(ml_cfg.get("arxiv", [])) or ("\0",)
-    kept = []
+    kept, untagged = [], []
     for p in papers.values():
         p["topics"] = tagger.topics_for(p)
         p["pis"] = tagger.pis_for(p)
         p.setdefault("added", today().isoformat())
         p["sections"] = sections_for(p, tagger, ml_cats)
         if not p["sections"]:
+            if p["kind"] == "article" and p["date"] >= cutoff:
+                untagged.append(p)
             continue
         # Buzz-only papers can be old (HN loves a 2015 classic) — age those by when we first saw them.
         ref = p["date"] if (p["topics"] or p["pis"]) else max(p["date"], p["added"])
@@ -242,17 +261,9 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
         # The ML firehose is huge: past a few days, keep only papers someone is paying attention to.
         if p["sections"] == ["ml"] and not p.get("buzz_score") and p["date"] < firehose_cutoff:
             continue
-        p = {**p}  # trim a copy: the archive keeps the full record
-        if len(p["authors"]) > MAX_AUTHORS:
-            p["n_authors"] = len(p["authors"])
-            middle = [a for a in p["authors"][10:-3] if tagger.is_pi_author(a, p["pis"])]
-            p["authors"] = p["authors"][:10] + ["…", *middle] + p["authors"][-3:]
-        # ML-only papers get a shorter abstract (most have an HF TL;DR, and there are a lot of them).
-        cap = MAX_ABSTRACT_ML if p["sections"] == ["ml"] else MAX_ABSTRACT
-        p["abstract"] = strip_label(p["abstract"])[:cap]
-        kept.append(p)
+        kept.append(trim(p, tagger))
     kept.sort(key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)
-    return kept
+    return kept, untagged
 
 
 def write_alerts(papers: list[dict], site_url: str) -> None:
@@ -307,7 +318,7 @@ def main() -> None:
     enrich(papers, signals)
     apply_buzz(papers, signals)
     papers = dedup_versions(papers)
-    final = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
+    final, untagged = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -320,18 +331,44 @@ def main() -> None:
         for a in p.get("aliases", []):
             in_window.setdefault(a, p)
     extras = favorites.load(synced, in_window, log)
-    (OUT_DIR / "favorites.json").write_text(json.dumps({"papers": extras}, ensure_ascii=False, separators=(",", ":")))
-    if "embed" in only:
-        embed.run(final + extras, embed.load_previous(args.previous), OUT_DIR, log)
-        layout.run(OUT_DIR, log, previous=fetch_json(args.previous, "map.json"),
-                   papers={p["id"]: p for p in final + extras}, name=ai.complete_json if "ai" in only else None)
+
+    # Journal papers no rule tagged get scored too, and stay if they matter to you (AI score) or sit
+    # among papers of one topic (similarity). Scores of the ones dropped are remembered, so a paper
+    # OpenAlex keeps listing for a week or two isn't re-scored every day.
+    dropped_before = (fetch_json(args.previous, "ai_dropped.json") or {}).get("papers", {})
+    for p in untagged:
+        if not p.get("ai") and p["id"] in dropped_before:
+            p["ai"] = dropped_before[p["id"]]
     pending = (fetch_json(args.previous, "ai_pending.json") or {}).get("batches", [])
     if "ai" in only:
-        pending = ai.run(final, pending, args.ai_wait, log, synced)
+        pending = ai.run(final + untagged, pending, args.ai_wait, log, synced)
         for p in final:  # final holds trimmed copies; the archive reads `papers`
             if "ai" in p:
                 papers[p["id"]]["ai"] = p["ai"]
     (OUT_DIR / "ai_pending.json").write_text(json.dumps({"batches": pending}))
+
+    vecs, similar = {}, set()
+    if "embed" in only:
+        vecs = embed.vectors(final + untagged + extras, embed.load_previous(args.previous), log)
+        similar = {p["id"] for p in tagging.by_similarity(untagged, final, vecs, tagger.section_of)}
+    relevant = lambda p: (s := (p.get("ai") or {}).get("score")) is not None and s >= KEEP_UNTAGGED_SCORE
+    kept = [p for p in untagged if p["id"] in similar or relevant(p)]
+    for p in kept:
+        p["sections"] = ["bio"]
+    kept_ids = {p["id"] for p in kept}
+    (OUT_DIR / "ai_dropped.json").write_text(json.dumps({"papers": {
+        p["id"]: {"score": p["ai"]["score"], **({"declined": True} if p["ai"].get("declined") else {})}
+        for p in untagged if p["id"] not in kept_ids and p.get("ai")}}, separators=(",", ":")))
+    log(f"  untagged journal papers: {len(kept)} of {len(untagged)} kept "
+        f"({len(similar)} tagged by similarity, {sum(relevant(p) and p['id'] not in similar for p in kept)} by AI score)")
+    final = sorted(final + [trim(p, tagger) for p in kept], key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)
+    extras = [e for e in extras if e["id"] not in kept_ids]
+
+    if "embed" in only:
+        embed.write(final + extras, vecs, OUT_DIR)
+        layout.run(OUT_DIR, log, previous=fetch_json(args.previous, "map.json"),
+                   papers={p["id"]: p for p in final + extras}, name=ai.complete_json if "ai" in only else None)
+    (OUT_DIR / "favorites.json").write_text(json.dumps({"papers": extras}, ensure_ascii=False, separators=(",", ":")))
     recent_cut = (today() - dt.timedelta(days=RECENT_DAYS)).isoformat()
     bio = [p for p in final if "bio" in p["sections"]]
     recent = [p for p in bio if p["date"] >= recent_cut]

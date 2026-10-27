@@ -41,18 +41,18 @@ def to_paper(w: dict, venue: str | None = None) -> dict | None:
 
 def works_by_filter(flt: str, days: int, venue: str | None = None, max_pages: int = 10) -> list[dict]:
     since = (today() - dt.timedelta(days=days)).isoformat()
-    papers, cursor = [], "*"
+    papers = []
     with client() as c:
-        for _ in range(max_pages):
+        # Plain page numbers: cursor paging past page 1 now needs an OpenAlex API key.
+        for page in range(1, max_pages + 1):
             resp = c.get(API, params={
                 "filter": f"{flt},from_publication_date:{since},type:{WORK_TYPES}", "select": SELECT,
-                "per-page": 200, "cursor": cursor, **openalex_params(),
+                "per-page": 200, "page": page, **openalex_params(),
             })
             resp.raise_for_status()
             data = resp.json()
             papers += [p for w in data["results"] if (p := to_paper(w, venue))]
-            cursor = data["meta"].get("next_cursor")
-            if not cursor or not data["results"]:
+            if len(data["results"]) < 200:
                 break
     return papers
 

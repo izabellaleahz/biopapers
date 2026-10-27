@@ -74,3 +74,43 @@ def _name_parts(name: str) -> tuple[str, str]:
     if len(parts) >= 2 and len(parts[-1]) == 1:  # "Uhler C" (PubMed style)
         return parts[-1], parts[0]
     return parts[0], parts[-1]
+
+
+def by_similarity(candidates: list[dict], tagged: list[dict], vecs: dict, section_of: dict[str, str],
+                  k: int = 8, min_votes: int = 6) -> list[dict]:
+    """Topics for papers the rules missed, from the papers most like them.
+
+    Broad journals (Nature, Science, PNAS, Nature Communications…) have no subject categories, so
+    keyword rules miss most of their biology. A candidate gets topic T when at least `min_votes` of its
+    `k` nearest tagged papers have T, and only if it's as close to them as a typical tagged paper is
+    to its own neighbours (so an astronomy paper can't borrow a topic from its least-unlike biology
+    papers). Sets p["topics"] and p["tagged_by"] on the candidates it tags, and returns those."""
+    import numpy as np
+
+    pool = [p for p in tagged if p["id"] in vecs and any(section_of.get(t) == "bio" for t in p["topics"])]
+    cands = [p for p in candidates if p["id"] in vecs]
+    if len(pool) < 100 or not cands:
+        return []
+    unit = lambda rows: rows / np.linalg.norm(rows, axis=1, keepdims=True).clip(1e-6)
+    m = unit(np.stack([vecs[p["id"]] for p in pool]).astype(np.float32))
+    # The bar: how close a tagged paper typically is to its k nearest tagged papers (30th percentile).
+    sample = m[np.random.default_rng(0).choice(len(m), min(1000, len(m)), replace=False)]
+    s = sample @ m.T
+    kth = np.sort(s, axis=1)[:, -(k + 1)]  # the +1 skips the paper itself
+    bar = float(np.percentile(kth, 30))
+    c = unit(np.stack([vecs[p["id"]] for p in cands]).astype(np.float32))
+    sims = c @ m.T
+    top = np.argpartition(-sims, k, axis=1)[:, :k]
+    out = []
+    for i, p in enumerate(cands):
+        if sims[i, top[i]].min() < bar:
+            continue
+        votes: dict[str, int] = {}
+        for j in top[i]:
+            for t in pool[j]["topics"]:
+                if section_of.get(t) == "bio":
+                    votes[t] = votes.get(t, 0) + 1
+        if topics := sorted(t for t, n in votes.items() if n >= min_votes):
+            p["topics"], p["tagged_by"] = topics, "similar papers"
+            out.append(p)
+    return out
