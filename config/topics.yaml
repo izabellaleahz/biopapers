@@ -230,10 +230,11 @@ topics:
     # Fetched from stat.ME / econ.EM keyword-gated, plus everything in the ML firehose. Title words
     # are specific: bare "causal" would catch every "causal language model" / "causal attention".
     keywords: ["causal inference", "causal discovery", "causal effect", "causal model", "structural causal",
-               "causal graph", "causal representation", "causal structure", "treatment effect", counterfactual,
+               "causal graph", "causal representation", "causal structure", "treatment effect",
+               "counterfactual inference", "counterfactual outcome", "counterfactual distribution",
                "instrumental variable", "do-calculus", "potential outcome", "propensity score", confounding,
                "unobserved confound", "interventional data", "interventional distribution",
                "difference-in-differences", "mediation analysis", "causal machine learning"]
     title_keywords: [causality, counterfactual, "treatment effect", "causal inference", "causal discovery",
                      "causal effect", "causal model", "causal represent", "causal structure", "causal graph",
-                     "causal reasoning", "causal machine learning", interventional]
+                     "causal reasoning", "causal machine learning", "interventional data"]

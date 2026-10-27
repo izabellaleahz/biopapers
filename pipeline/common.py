@@ -31,17 +31,23 @@ def client(timeout: float = 30) -> httpx.Client:
                         transport=httpx.HTTPTransport(retries=2))  # retries connect errors/resets
 
 
-def get(c: httpx.Client, url: str, tries: int = 3, **kw) -> httpx.Response:
-    """GET with retries + backoff — for long paginated pulls where one dropped page shouldn't sink the source."""
+def get(c: httpx.Client, url: str, tries: int = 4, **kw) -> httpx.Response:
+    """GET with retries + backoff — for long paginated pulls where one dropped page shouldn't sink the source.
+    Rate limits (429) and overload (503) get a real pause: the server's Retry-After, else 20s, 40s, 60s."""
     for attempt in range(tries):
         try:
             resp = c.get(url, **kw)
             resp.raise_for_status()
             return resp
-        except (httpx.TransportError, httpx.HTTPStatusError):
+        except (httpx.TransportError, httpx.HTTPStatusError) as ex:
             if attempt == tries - 1:
                 raise
-            time.sleep(3 * (attempt + 1))
+            status = ex.response.status_code if isinstance(ex, httpx.HTTPStatusError) else None
+            if status in (429, 503):
+                retry_after = ex.response.headers.get("retry-after", "")
+                time.sleep(min(120, int(retry_after)) if retry_after.isdigit() else 20 * (attempt + 1))
+            else:
+                time.sleep(3 * (attempt + 1))
 
 
 def openalex_params() -> dict:

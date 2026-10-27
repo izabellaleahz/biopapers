@@ -362,7 +362,7 @@ def main() -> None:
         p["sections"] = ["bio"]
     kept_ids = {p["id"] for p in kept}
     (OUT_DIR / "ai_dropped.json").write_text(json.dumps({"papers": {
-        p["id"]: {"score": p["ai"]["score"], **({"declined": True} if p["ai"].get("declined") else {})}
+        p["id"]: {"score": p["ai"]["score"], "v": p["ai"].get("v"), **({"declined": True} if p["ai"].get("declined") else {})}
         for p in untagged if p["id"] not in kept_ids and p.get("ai")}}, separators=(",", ":")))
     log(f"  untagged journal papers: {len(kept)} of {len(untagged)} kept "
         f"({len(similar)} tagged by similarity, {sum(relevant(p) and p['id'] not in similar for p in kept)} by AI score)")

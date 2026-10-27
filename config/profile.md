@@ -23,6 +23,12 @@ Core interests, roughly in priority order:
 - Trogocytosis and other membrane/antigen transfer between immune cells.
 - Host–pathogen biology and virology, gene regulation and chromatin — when the finding is broad.
 
+Causal inference is a core interest, from my training with Caroline Uhler: causal discovery and
+structure learning (especially from interventional / perturbation data), causal representation
+learning, identifiability, treatment-effect estimation and experimental design. I also follow graph
+theory and network science: spectral and extremal graph theory, random graphs, graph algorithms,
+and learning on graphs when it's principled rather than another GNN benchmark.
+
 In ML / CS I want the papers that move the field: major new models, training methods, agent
 and reasoning advances, interpretability findings, and evaluations that change how people think.
 Incremental benchmark gains, narrow applications and routine workshop papers matter much less.

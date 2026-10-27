@@ -44,6 +44,16 @@ def fetch_rxiv(server: str, days: int) -> list[dict]:
     return papers
 
 
+_arxiv_last_call = 0.0
+ARXIV_SPACING = 3.5  # seconds between any two arXiv API calls in a build, across all fetches
+
+
+def _arxiv_wait() -> None:
+    global _arxiv_last_call
+    time.sleep(max(0.0, _arxiv_last_call + ARXIV_SPACING - time.time()))
+    _arxiv_last_call = time.time()
+
+
 def fetch_arxiv(categories: list[str], days: int, page_size: int = 200) -> list[dict]:
     """Recent arXiv submissions in the given categories ('q-bio' = all q-bio.*).
 
@@ -55,6 +65,7 @@ def fetch_arxiv(categories: list[str], days: int, page_size: int = 200) -> list[
     papers, start = [], 0
     with client(timeout=60) as c:
         while True:
+            _arxiv_wait()
             resp = get(c, ARXIV_API, params={
                 "search_query": query, "sortBy": "submittedDate", "sortOrder": "descending",
                 "start": start, "max_results": page_size,
@@ -81,5 +92,4 @@ def fetch_arxiv(categories: list[str], days: int, page_size: int = 200) -> list[
             if entries[-1].published[:10] < cutoff:
                 break
             start += page_size
-            time.sleep(3)
     return [p for p in papers if p["date"] >= cutoff]

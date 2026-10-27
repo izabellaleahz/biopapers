@@ -13,6 +13,7 @@ Two ways to reach the model, picked by which key is set:
 With neither, the step is skipped.
 """
 
+import hashlib
 import json
 import os
 import time
@@ -55,6 +56,16 @@ SCHEMA = {
 def load_profile() -> str:
     text = (CONFIG_DIR / "profile.md").read_text()
     return "\n".join(line for line in text.splitlines() if not line.startswith("#")).strip()
+
+
+def profile_version() -> str:
+    """Stamped on every score. Editing profile.md (or the instructions) changes it, and papers scored
+    against the old version get re-scored, newest first."""
+    return hashlib.sha1(f"{INSTRUCTIONS}\n{load_profile()}".encode()).hexdigest()[:8]
+
+
+def needs_score(p: dict, version: str) -> bool:
+    return not p.get("ai") or p["ai"].get("v") != version
 
 
 def titles(entries: dict, by_id: dict[str, dict], limit: int) -> list[str]:
@@ -112,7 +123,7 @@ def apply_scores(text: str, ids: list[str], by_id: dict[str, dict]) -> int:
         n = item.get("n", 0)
         if 1 <= n <= len(ids) and (p := by_id.get(ids[n - 1])):
             p["ai"] = {"score": max(0, min(10, int(item["score"]))),
-                       "tldr": item["tldr"].strip(), "why": item["why"].strip()}
+                       "tldr": item["tldr"].strip(), "why": item["why"].strip(), "v": profile_version()}
             scored += 1
     return scored
 
@@ -218,7 +229,7 @@ def score_chunk(c: httpx.Client, system: str, chunk: list[dict], by_id: dict[str
     reason = choice.get("finish_reason")
     if reason == "content_filter":
         if len(chunk) == 1:
-            by_id[ids[0]]["ai"] = {"score": None, "declined": True}
+            by_id[ids[0]]["ai"] = {"score": None, "declined": True, "v": profile_version()}
             return 0, 0, cost, None
         half = len(chunk) // 2
         parts = [score_chunk(c, system, part, by_id) for part in (chunk[:half], chunk[half:])]
@@ -253,7 +264,7 @@ def run(papers: list[dict], pending: list[dict], wait_min: float, log, synced: d
             log("  ai: skipped (no ANTHROPIC_API_KEY or OPENROUTER_API_KEY)")
             return pending
         by_id = {p["id"]: p for p in papers}
-        todo = [p for p in papers if not p.get("ai")]
+        todo = [p for p in papers if needs_score(p, profile_version())]
         if todo:
             run_openrouter(todo, reader_prompt(synced, by_id), by_id, log)
         else:
@@ -273,7 +284,7 @@ def run(papers: list[dict], pending: list[dict], wait_min: float, log, synced: d
         except anthropic.NotFoundError:
             log(f"  ai: batch {b['id']} is gone — its papers will be resubmitted")
     waiting = {pid for b in still for ids in b["requests"].values() for pid in ids}
-    todo = [p for p in papers if not p.get("ai") and p["id"] not in waiting]
+    todo = [p for p in papers if needs_score(p, profile_version()) and p["id"] not in waiting]
     if not todo:
         log(f"  ai: nothing new to score ({len(still)} batch(es) still running)")
         return still
