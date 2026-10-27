@@ -1,11 +1,12 @@
 """Preprint servers: bioRxiv + medRxiv (official API) and arXiv (export API)."""
 
 import datetime as dt
+import re
 import time
 
 import feedparser
 
-from ..common import client, flip_name, get, make_paper, today
+from ..common import client, flip_name, get, make_paper, parse_date, today
 
 RXIV_API = "https://api.biorxiv.org/details/{server}/{start}/{end}/{cursor}/json"
 ARXIV_API = "https://export.arxiv.org/api/query"
@@ -54,7 +55,53 @@ def _arxiv_wait() -> None:
     _arxiv_last_call = time.time()
 
 
-def fetch_arxiv(categories: list[str], days: int, page_size: int = 200) -> list[dict]:
+ARXIV_RSS = "https://rss.arxiv.org/rss/"
+RSS_DAYS = 3  # lookbacks this short come from the daily RSS listing; longer ones (backfills) try the API
+
+
+def fetch_arxiv(categories: list[str], days: int) -> list[dict]:
+    """Recent arXiv papers in the given categories ('q-bio' = all q-bio.*).
+
+    arXiv's query API rate-limits / times out from shared CI IPs (GitHub runners), so daily builds
+    read the RSS listing of the latest announcement instead, which arXiv serves separately for this.
+    A backfill tries the API and falls back to RSS if it fails."""
+    if days <= RSS_DAYS:
+        return fetch_arxiv_rss(categories)
+    try:
+        return fetch_arxiv_api(categories, days)
+    except Exception as ex:
+        print(f"  arXiv API failed ({ex.__class__.__name__}), using the RSS listing instead", flush=True)
+        return fetch_arxiv_rss(categories)
+
+
+def fetch_arxiv_rss(categories: list[str]) -> list[dict]:
+    """New and cross-listed papers from the latest daily announcement (replacements skipped)."""
+    with client(timeout=120) as c:
+        resp = get(c, ARXIV_RSS + "+".join(categories))
+    papers = []
+    for e in feedparser.parse(resp.content).entries:
+        if e.get("arxiv_announce_type") not in ("new", "cross"):
+            continue
+        arxiv_id = e.link.rsplit("/abs/", 1)[-1].split("v")[0]
+        tags = [t["term"] for t in e.get("tags", [])]
+        p = make_paper(
+            doi=f"10.48550/arxiv.{arxiv_id}",
+            title=e.title,
+            authors=[a.strip() for a in e.get("author", "").split(",") if a.strip()],
+            abstract=re.sub(r"^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*", "", e.get("summary", "")),
+            date=parse_date(e.get("published")),
+            venue="arXiv",
+            kind="preprint",
+            url=f"https://arxiv.org/abs/{arxiv_id}",
+            category=tags[0] if tags else "",
+        )
+        if p:
+            p["arxiv_cats"] = tags
+            papers.append(p)
+    return papers
+
+
+def fetch_arxiv_api(categories: list[str], days: int, page_size: int = 200) -> list[dict]:
     """Recent arXiv submissions in the given categories ('q-bio' = all q-bio.*).
 
     Pages newest-first until entries are older than the lookback window. arXiv asks
