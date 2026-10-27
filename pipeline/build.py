@@ -105,6 +105,9 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger) 
     ml = sources.get("ml", {})
     if "ml" in only and ml.get("arxiv"):
         papers += timed("ml arxiv", preprints.fetch_arxiv, ml["arxiv"], min(days, ml.get("firehose_days", 3)))
+    if "ml" in only and ml.get("arxiv_keyword_only"):
+        got = timed("ml arxiv (keyword-gated)", preprints.fetch_arxiv, ml["arxiv_keyword_only"], days)
+        papers += [p for p in got if tagger.keyword_topics_for(p, "ml")]
     if "hf" in only and ml.get("huggingface"):
         # Upvotes keep climbing for days, so always refresh at least the last week.
         hf_days = min(max(days, 7), ml.get("huggingface_days", 30))
@@ -258,8 +261,10 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
         ref = p["date"] if (p["topics"] or p["pis"]) else max(p["date"], p["added"])
         if ref < (pi_cutoff if p["pis"] else cutoff):
             continue
-        # The ML firehose is huge: past a few days, keep only papers someone is paying attention to.
-        if p["sections"] == ["ml"] and not p.get("buzz_score") and p["date"] < firehose_cutoff:
+        # The ML firehose is huge: past a few days, keep only papers someone is paying attention to
+        # (or that sit in a niche tab marked `keep`).
+        if (p["sections"] == ["ml"] and not p.get("buzz_score") and p["date"] < firehose_cutoff
+                and not tagger.keep_topics.intersection(p["topics"])):
             continue
         kept.append(trim(p, tagger))
     kept.sort(key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)

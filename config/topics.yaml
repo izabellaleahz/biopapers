@@ -17,6 +17,8 @@
 #                     where the papers are scattered across many journals.
 #
 #   section         — "bio" (default) or "ml": which top-level section the tab lives in
+#   keep            — ML tabs only: keep the tab's papers the whole window, not just the firehose's
+#                     few days (for niche tabs with few papers and little social buzz)
 #
 # Edits take effect on the next pipeline run (re-tags everything already collected).
 # `color` is the pastel accent for the tab + card edge.
@@ -202,3 +204,36 @@ topics:
     keywords: ["AI for science", "scientific discovery", "drug discovery", "physics-informed", "weather forecast",
                "materials discovery", "protein", "single-cell", "molecular generation"]
     title_keywords: [molecul, protein, materials, climate, weather, "scientific", genom, biolog]
+
+  - slug: graphs
+    section: ml
+    label: Graph Theory
+    color: "#8fa8d6"
+    keep: true
+    arxiv: [cs.DM]
+    # Graph theory proper (math.CO / cs.DM, fetched keyword-gated, see sources.yaml) plus network
+    # science and learning on graphs. Title words are plural / compound on purpose: "graph" alone
+    # would also prefix-match "graphical", "graphics" and "graphene".
+    keywords: ["graph theory", "spectral graph", "graph Laplacian", "random graph", "planar graph",
+               "chromatic number", "graph coloring", "graph colouring", "Ramsey", "extremal graph",
+               "graph minor", treewidth, "perfect matching", "Hamiltonian cycle", "expander graph",
+               "graph isomorphism", "network science", "community detection", "graph neural network",
+               GNN, "message passing neural", "graph transformer", "graph signal processing"]
+    title_keywords: [graphs, hypergraph, subgraph, digraph, "graph theor", "graph neural", "graph learning",
+                     "graph transformer", "random graph", "spectral graph", "graph colo"]
+
+  - slug: causal
+    section: ml
+    label: Causal Inference
+    color: "#d98ad9"
+    keep: true
+    # Fetched from stat.ME / econ.EM keyword-gated, plus everything in the ML firehose. Title words
+    # are specific: bare "causal" would catch every "causal language model" / "causal attention".
+    keywords: ["causal inference", "causal discovery", "causal effect", "causal model", "structural causal",
+               "causal graph", "causal representation", "causal structure", "treatment effect", counterfactual,
+               "instrumental variable", "do-calculus", "potential outcome", "propensity score", confounding,
+               "unobserved confound", "interventional data", "interventional distribution",
+               "difference-in-differences", "mediation analysis", "causal machine learning"]
+    title_keywords: [causality, counterfactual, "treatment effect", "causal inference", "causal discovery",
+                     "causal effect", "causal model", "causal represent", "causal structure", "causal graph",
+                     "causal reasoning", "causal machine learning", interventional]

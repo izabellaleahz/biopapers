@@ -101,6 +101,9 @@ ml:
   # after that only ones with Hugging Face upvotes or social buzz stay (keeps the data small).
   arxiv: [cs.LG, cs.AI, cs.CL, cs.CV, cs.RO, cs.MA, stat.ML]
   firehose_days: 3
+  # Also fetched, but only papers matching an ML tab's keywords are kept: graph theory lives in
+  # combinatorics / discrete math, causal inference in statistical methodology and econometrics.
+  arxiv_keyword_only: [math.CO, cs.DM, cs.SI, stat.ME, econ.EM]
   huggingface: true     # HF Daily Papers — curated, with upvotes, AI TL;DRs, GitHub links
   huggingface_days: 30
 

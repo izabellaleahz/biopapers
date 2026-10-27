@@ -30,6 +30,7 @@ class Tagger:
             })
         self.people = [(p["name"], *_name_parts(p["name"])) for p in people]
         self.section_of = {t["slug"]: t["section"] for t in self.topics}
+        self.keep_topics = {t["slug"] for t in topics if t.get("keep")}
 
     def topics_for(self, p: dict) -> list[str]:
         cats = p.get("arxiv_cats") or []
