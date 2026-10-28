@@ -125,6 +125,21 @@ ml:
 buzz:
   hackernews: true      # HN stories linking to papers (free Algolia API)
   sciencedaily: true    # press coverage — ScienceDaily top stories, resolved to DOIs
-  bluesky: true         # posts sharing paper links. Works unauthenticated (thin);
-                        # set BSKY_HANDLE + BSKY_APP_PASSWORD env/secrets for much better coverage
   lookback_days: 7
+  x:                    # X/Twitter recent search — paid, billed per post read (needs X_BEARER_TOKEN).
+                        # Each query reads its most-engaged posts first, up to max_posts per pull.
+                        # 600 posts a pull, every other day ≈ $1.50/day at $0.005/post (check the Developer
+                        # Console's rate card). Billing is per post, not per pull: pulling less often costs
+                        # less and only delays a breakout paper by up to two days — most-liked-first means
+                        # the window's big posts are still caught, with likes that have had time to build.
+    min_hours: 44       # every other day with the daily 12:00 UTC cron (slack for late runs); pushes rebuild too
+    queries:
+      bio:
+        max_posts: 300
+        min_likes: 5    # only posts someone noticed — keeps bots and self-promotion out of the bill
+        domains: [biorxiv.org, medrxiv.org, nature.com, science.org, cell.com, pnas.org,
+                  elifesciences.org, nejm.org, doi.org]
+      cs:
+        max_posts: 300
+        min_likes: 10   # ML Twitter is louder
+        domains: [arxiv.org, huggingface.co/papers, alphaxiv.org]

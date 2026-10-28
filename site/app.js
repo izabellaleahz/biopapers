@@ -39,7 +39,7 @@ const FEATURES = {
   saved: { label: "Like papers I saved", def: 0.6 },
   hidden: { label: "Like papers I marked not interested", def: -0.6, min: -2, max: 0 },
   recency: { label: "New", def: 1 },
-  buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
+  buzz: { label: "Buzz (X · HF upvotes · HN · press)", def: 0.6 },
   pi: { label: "From a watched PI", def: 1 },
   journal: { label: "Peer-reviewed (in a journal)", def: 0.3 },
 };
@@ -782,7 +782,7 @@ function card(p) {
   const hot = [
     hf.upvotes && arxivId ? `<a class="badge hot" href="https://huggingface.co/papers/${esc(arxivId)}" target="_blank" rel="noopener" title="Hugging Face Daily Papers upvotes">▲ ${hf.upvotes} HF</a>` : "",
     b.hn ? `<a class="badge hot" href="${esc(b.hn_url)}" target="_blank" rel="noopener" title="Hacker News points">HN ${b.hn}</a>` : "",
-    b.bsky ? `<span class="badge hot" title="Bluesky posts sharing this (likes+reposts: ${b.bsky_likes || 0})">Bluesky ${b.bsky}</span>` : "",
+    b.x ? `<a class="badge hot" href="${esc(b.x_url || "#")}" target="_blank" rel="noopener" title="People sharing this on X (likes+reposts: ${b.x_likes || 0}) — opens the most-liked post">X ${b.x}</a>` : "",
     ...(b.news || []).slice(0, 2).map((n) => `<a class="badge hot" href="${esc(n.url)}" target="_blank" rel="noopener" title="${esc(n.title)}">press</a>`),
   ].join("");
 

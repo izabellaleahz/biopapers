@@ -32,7 +32,7 @@ multi-source ingest (Nature/Cell/Science + medRxiv + aggregators), LLM/embedding
 - **Votes/saves:** per-browser localStorage for now (option A). Upgrade paths: private-Gist sync (B)
   or Supabase + GitHub login for shared lab votes (C).
 - **Sources:** bioRxiv, medRxiv, arXiv, ~35 journal RSS feeds, OpenAlex (ISSN journals, PI watchlist,
-  niche-topic search). Buzz = HN + Bluesky + ScienceDaily (X/Twitter API isn't free).
+  niche-topic search). Buzz = X (paid, budgeted; distinct sharers) + HN + ScienceDaily + HF upvotes for ML.
 - **New topics:** B cells & antibodies, PhIP-seq, viral mimicry, trogocytosis, CRISPR & Perturb-seq.
 - **PI watchlist:** Caroline Uhler, Nir Hacohen, Stefani Spranger (`config/people.yaml`).
 - **Ranking:** user-tunable weighted blend (recency / buzz / PI / similarity-to-saves / upvotes), per-topic weights.

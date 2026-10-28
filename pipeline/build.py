@@ -15,6 +15,7 @@ Outputs:
     site/data/favorites.json   ♥ favorites outside the window, so they're on the map (see favorites.py)
     site/data/ai_pending.json   AI-scoring batches still running, collected next build (see ai.py)
     site/data/ai_dropped.json   scores of untagged journal papers that didn't make the cut (not re-scored)
+    site/data/buzz_state.json   who shared each paper on X (hashed), kept across runs (see apply_buzz)
     site/alerts.xml         RSS feed of PI-watchlist + buzzing papers (subscribe for alerts)
     archive/papers-YYYY-MM.jsonl.gz   every paper seen, untruncated and never pruned (see archive.py)
 """
@@ -22,6 +23,7 @@ Outputs:
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -37,8 +39,10 @@ RECENT_DAYS = 10  # papers.json = last 10 days (loads first); older.json = the r
 ALERTS_PATH = ROOT / "site" / "alerts.xml"
 ALL_SOURCES = ["biorxiv", "medrxiv", "arxiv", "rss", "openalex", "search", "pis", "ml", "hf", "buzz",
                "embed", "ai"]  # the last two are enrichment steps, not sources
-BUZZ_ALERT_SCORE = 5       # bio: e.g. 100 HN points, 5 Bluesky posts, or 2 press stories
-BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~300 HF upvotes — HF votes are plentiful, so a higher bar
+BUZZ_ALERT_SCORE = 8       # bio: e.g. 6 people sharing it, ~100 HN points, or 3 press stories (see buzz_score)
+BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~12 people sharing it or ~800 HF upvotes — ML gets far more attention
+BUZZ_STATE_DAYS = 30       # forget who shared a paper this long after anyone last did
+BIO_DOMAINS = {"Life Sciences", "Health Sciences"}  # OpenAlex domains that make a stray buzzing paper "bio"
 MAX_AUTHORS = 13  # keep first 10 + last 3 (PIs are usually last)
 MAX_ABSTRACT = 1500
 MAX_ABSTRACT_ML = 900
@@ -89,7 +93,8 @@ def timed(label: str, fn, *args) -> list | dict:
 
 
 def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger,
-                     people: list[dict]) -> tuple[list[dict], dict]:
+                     people: list[dict], buzz_state: dict | None = None) -> tuple[list[dict], dict]:
+    """(papers, buzz signals by DOI). `buzz_state["x_last"]` is when X was last pulled, and is updated."""
     sources = load_config("sources")
     pre = sources.get("preprints", {})
     papers: list[dict] = []
@@ -139,8 +144,22 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger,
     if "buzz" in only:
         cfg = sources.get("buzz", {})
         look = cfg.get("lookback_days", 7)
-        fetchers = {"hackernews": (buzz.hackernews, look), "bluesky": (buzz.bluesky, look),
-                    "sciencedaily": (buzz.sciencedaily,)}
+        fetchers = {"hackernews": (buzz.hackernews, look), "sciencedaily": (buzz.sciencedaily,)}
+        if (xc := cfg.get("x")) and xc.get("queries") and buzz_state is not None:
+            # X bills per post read, and every push to main rebuilds too: pull at most once per
+            # `min_hours`, covering the whole gap since the last pull (recent search reaches back 7 days;
+            # the first pull takes all of it, so Trending starts full).
+            last = buzz_state.get("x_last")
+            x_hours = (time.time() - dt.datetime.fromisoformat(last).timestamp()) / 3600 if last else None
+            if x_hours is not None and x_hours < xc.get("min_hours", 20):
+                log(f"  buzz x: last pulled {x_hours:.0f}h ago, skipped")
+            else:
+                def pull_x(hours):
+                    out = buzz.x(hours, xc["queries"], log)
+                    if os.environ.get("X_BEARER_TOKEN"):  # it ran (a failure raises): the posts are billed
+                        buzz_state["x_last"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+                    return out
+                fetchers["x"] = (pull_x, min(167, max(26, x_hours + 2)) if x_hours is not None else 167)
         for name, (fn, *args) in fetchers.items():
             if cfg.get(name):
                 for doi, sig in timed(f"buzz {name}", fn, *args).items():
@@ -170,8 +189,12 @@ def enrich(papers: dict[str, dict], signals: dict[str, dict]) -> None:
             if p.get("doi") and not p.get("enriched") and p.get("added", "9999") >= week_ago
             and (len(p["abstract"]) < 400 or not p["authors"])]
     missing = [d for d in signals if d not in papers]
+    # Buzzing papers outside every tab need their research area to land in the right section (or none).
+    unplaced = [d for d in signals if d in papers and "domain" not in papers[d] and not papers[d].get("topics")
+                and not papers[d].get("hf") and not papers[d].get("arxiv_cats")
+                and papers[d]["venue"] not in ("bioRxiv", "medRxiv")]
     try:
-        found = openalex.lookup_dois(thin + missing)
+        found = openalex.lookup_dois(thin + missing + unplaced)
     except Exception as ex:
         log(f"  enrich: FAILED ({ex})")
         return
@@ -186,6 +209,10 @@ def enrich(papers: dict[str, dict], signals: dict[str, dict]) -> None:
     for doi in missing:
         if o := found.get(doi):
             papers[doi] = {**o, "enriched": True}
+    for doi in unplaced:
+        for k in ("domain", "field"):
+            if v := (found.get(doi) or {}).get(k):
+                papers[doi][k] = v
     log(f"  enrich: {sum(d in found for d in thin)}/{len(thin)} thin records filled, "
         f"{sum(d in found for d in missing)}/{len(missing)} buzzing papers added")
 
@@ -221,14 +248,54 @@ def enrich_abstracts(papers: dict[str, dict]) -> set[str]:
     return changed
 
 
-def apply_buzz(papers: dict[str, dict], signals: dict[str, dict]) -> None:
+def buzz_score(b: dict, hf: dict | None) -> float:
+    """How much attention a paper is getting. Breadth first: each person sharing it counts 1, scaled up
+    to ~2-3x by how much engagement their posts got, so ten people sharing a paper beat one big account
+    with 300 likes. HN points and HF upvotes count on a log scale (both run into the hundreds)."""
+    def shared(n, eng):
+        return n * (1 + math.log10(1 + eng / n) / 2) if n else 0
+    return round(shared(b.get("x", 0), b.get("x_likes", 0))
+                 + 4 * math.log10(1 + b.get("hn", 0)) + 3 * len(b.get("news", []))
+                 + 3 * math.log2(1 + (hf or {}).get("upvotes", 0) / 25), 2)
+
+
+SOCIAL = ("x",)
+
+
+def apply_buzz(papers: dict[str, dict], signals: dict[str, dict], state: dict[str, dict]) -> None:
+    """Fold this run's signals into the papers. Who shared a paper on X accumulates in `state`
+    ({doi: {"x": {account: engagement}, "seen": date}}) across runs, so a paper shared
+    by different people on different days adds up, and a later sighting of a post updates its likes.
+    HN points and press stories are a fresh read each run."""
+    now = today().isoformat()
     for doi, sig in signals.items():
+        if any(sig.get(net) for net in SOCIAL):
+            st = state.setdefault(doi, {})
+            st["seen"] = now
+            for net in SOCIAL:
+                accts = st.setdefault(net, {}) if sig.get(net) else {}
+                for acct, eng in (sig.get(net) or {}).items():
+                    accts[acct] = max(accts.get(acct, 0), eng)
+            if sig.get("x_url") and (top := max(sig["x"].values())) >= st.get("x_top", -1):
+                st["x_url"], st["x_top"] = sig["x_url"], top
         if p := papers.get(doi):
-            p["buzz"] = sig
+            p["buzz"] = {**(p.get("buzz") or {}), **{k: v for k, v in sig.items() if k not in SOCIAL and k != "x_url"}}
+    cut = (today() - dt.timedelta(days=BUZZ_STATE_DAYS)).isoformat()
+    for doi in [d for d, st in state.items() if st.get("seen", "") < cut]:
+        del state[doi]
     for p in papers.values():
-        b = p.get("buzz") or {}
-        p["buzz_score"] = round(b.get("hn", 0) / 20 + b.get("bsky", 0) + b.get("bsky_likes", 0) / 50
-                                + 3 * len(b.get("news", [])) + (p.get("hf") or {}).get("upvotes", 0) / 20, 2)
+        # Shares only ever come from the state (older records also carry dropped Bluesky counts).
+        b = {k: v for k, v in (p.get("buzz") or {}).items() if k not in ("x", "x_likes", "x_url", "bsky", "bsky_likes")}
+        for net in SOCIAL:
+            if accts := (state.get(p.get("doi") or "") or {}).get(net):
+                b[net], b[f"{net}_likes"] = len(accts), sum(accts.values())
+        if url := (state.get(p.get("doi") or "") or {}).get("x_url"):
+            b["x_url"] = url
+        if b:
+            p["buzz"] = b
+        else:
+            p.pop("buzz", None)
+        p["buzz_score"] = buzz_score(b, p.get("hf"))
 
 
 def dedup_versions(papers: dict[str, dict]) -> dict[str, dict]:
@@ -247,7 +314,10 @@ def dedup_versions(papers: dict[str, dict]) -> dict[str, dict]:
             if pre := next((r for r in rest if r["kind"] == "preprint"), None):
                 keep.setdefault("preprint_url", pre["url"])
             keep["added"] = min(r.get("added", r["date"]) for r in group)
-            keep["buzz_score"] = max(r.get("buzz_score", 0) for r in group)
+            top = max(group, key=lambda r: r.get("buzz_score", 0))  # the version people are sharing
+            keep["buzz_score"] = top.get("buzz_score", 0)
+            if top.get("buzz"):
+                keep["buzz"] = top["buzz"]
         out[keep["id"]] = keep
     return out
 
@@ -259,8 +329,14 @@ def sections_for(p: dict, tagger: Tagger, ml_cats: tuple, ml_venues: frozenset =
         secs.add("bio")
     if p.get("hf") or any(c.startswith(ml_cats) for c in p.get("arxiv_cats", [])) or p["venue"] in ml_venues:
         secs.add("ml")
-    if not secs and p.get("buzz_score", 0) > 0:  # off-topic but buzzing
-        secs.add("ml" if p["venue"] == "arXiv" else "bio")
+    # Off-topic but buzzing: Trending is "what's big in biology / in CS", so a viral political-science or
+    # number-theory paper stays out. Its section comes from the venue or OpenAlex's research area.
+    if not secs and p.get("buzz_score", 0) > 0:
+        if (p["venue"] in ("bioRxiv", "medRxiv") or p.get("domain") in BIO_DOMAINS
+                or any(c.startswith("q-bio") for c in p.get("arxiv_cats", []))):
+            secs.add("bio")
+        elif p.get("field") == "Computer Science":
+            secs.add("ml")
     return sorted(secs)
 
 
@@ -367,15 +443,17 @@ def main() -> None:
     log(f"previous: {len(previous)} papers · fetching last {days} days")
 
     only = set(args.only.split(","))
-    fresh, signals = fetch_everything(days, args.keep_days, only, tagger, watched)
+    buzz_state = fetch_json(args.previous, "buzz_state.json") or {}
+    fresh, signals = fetch_everything(days, args.keep_days, only, tagger, watched, buzz_state)
     papers = merge(previous, fresh)
     enrich(papers, signals)
     refreshed = enrich_abstracts(papers) if "openalex" in only or "rss" in only else set()
-    apply_buzz(papers, signals)
+    apply_buzz(papers, signals, buzz_state.setdefault("papers", {}))
     papers = dedup_versions(papers)
     final, untagged = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / "buzz_state.json").write_text(json.dumps(buzz_state, separators=(",", ":")))
     try:
         synced = read_gist_state(os.environ.get("BIOPAPERS_GIST_ID"))
     except Exception as ex:

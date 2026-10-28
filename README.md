@@ -5,7 +5,7 @@ Lowkey, alphaXiv-inspired paper feed for the Gilbert lab, in two sections:
 - **Bio** — new papers from the major journals + bioRxiv/medRxiv/arXiv q-bio, bucketed into
   interest tabs, with a PI watchlist and a "Buzz" tab for papers blowing up online.
 - **ML / CS** — alphaXiv-style: every new arXiv ML paper (cs.LG/AI/CL/CV/RO/MA, stat.ML) plus
-  Hugging Face Daily Papers, with a "Trending" tab (HF upvotes · HN · Bluesky), AI TL;DRs,
+  Hugging Face Daily Papers, with a "Trending" tab (X · HF upvotes · HN), AI TL;DRs,
   code links + GitHub stars, and alphaXiv discussion links.
 
 Save (☆), favorite (♥) and not-interested (✕) work across both, and so does the one search box:
@@ -25,7 +25,7 @@ python -m pipeline.build                          site/index.html + app.js
           ~35 journal RSS feeds                      settings + data in localStorage
           OpenAlex (ISSN journals, PI watchlist,
                     niche-topic literature search)
-  buzz:   Hacker News · Bluesky · ScienceDaily
+  buzz:   X · Hacker News · ScienceDaily
   merge with yesterday's data → dedup → tag
   embed (bge-small, local) → UMAP map + nearest neighbours
   AI score + TL;DR per paper (Claude Haiku 5.5, batch API)
@@ -153,7 +153,7 @@ committing data. Optional repo secrets/variables:
 
 | Name | Kind | Why |
 |------|------|-----|
-| `BSKY_HANDLE`, `BSKY_APP_PASSWORD` | secrets | Authenticated Bluesky search — much better buzz coverage than anonymous ([make an app password](https://bsky.app/settings/app-passwords)) |
+| `X_BEARER_TOKEN` | secret | X recent search for the most-engaged posts linking to papers — paid per post read, budgeted in `config/sources.yaml` (`buzz.x`), pulled every other day |
 | `OPENALEX_MAILTO` | variable | Contact email for OpenAlex's polite pool |
 | `OPENALEX_API_KEY` | secret | If OpenAlex rate-limits anonymous use |
 | `ANTHROPIC_API_KEY` | secret | AI scores + TL;DRs via Anthropic (batch, cheapest) |
@@ -165,7 +165,11 @@ committing data. Optional repo secrets/variables:
 - **Votes/saves** live in localStorage; turn on Gist sync to carry them across browsers (needs a
   GitHub token with only the `gist` scope, pasted once per device). Shared lab votes would need a
   small backend (e.g. Supabase) — see `CONSIDERATIONS.md`.
-- **No X/Twitter** — its API isn't free. Buzz uses HN + Bluesky + press coverage instead.
+- **X is budgeted, not complete** — each pull (every other day) reads only the few hundred most-engaged posts per
+  query (bio venues; arXiv/HF), so it finds what's popular but undercounts the long tail. Buzz counts
+  distinct people sharing a paper on X (accumulated across days in `buzz_state.json`), not posts,
+  and drops bots/aggregators. Off-topic papers only reach Trending if OpenAlex files them under biology
+  or CS.
 - **Abstracts:** Nature/Science/Cell RSS give short summaries; we backfill from OpenAlex,
   which often has no abstract for Elsevier/Springer papers.
 - **Window:** 30 days for the general feed, 180 days for watched PIs (the archive keeps everything). The ML arXiv firehose

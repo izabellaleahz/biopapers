@@ -6,7 +6,7 @@ from ..common import client, make_paper, norm_doi, openalex_params, today
 
 API = "https://api.openalex.org/works"
 SELECT = ("doi,title,publication_date,type,authorships,abstract_inverted_index,"
-          "primary_location,ids")
+          "primary_location,ids,primary_topic")
 WORK_TYPES = "article|preprint|review|letter"  # skip datasets, software releases, errata
 
 
@@ -36,6 +36,10 @@ def to_paper(w: dict, venue: str | None = None) -> dict | None:
         venue=venue or source or "Other",
         kind="preprint" if is_preprint else "article",
         url=loc.get("landing_page_url") or "",
+        # Its research area ("Life Sciences" / "Computer Science"): files a paper that buzzed in from
+        # outside every tab under the right section, or under none.
+        **{k: v for k, v in (("domain", ((w.get("primary_topic") or {}).get("domain") or {}).get("display_name")),
+                             ("field", ((w.get("primary_topic") or {}).get("field") or {}).get("display_name"))) if v},
     )
 
 
