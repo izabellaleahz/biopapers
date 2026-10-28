@@ -63,7 +63,9 @@ def fetch_json(base: str | None, name: str) -> dict | None:
     try:
         if src.startswith("http"):
             with client() as c:
-                resp = c.get(src)
+                # Pages' CDN serves a file up to 10 minutes stale; a build starting right after the last
+                # one deployed would carry the build before it forward (and, for buzz_state.json, re-bill X).
+                resp = c.get(src, params={"v": int(time.time())})
                 if resp.status_code == 404:
                     return None
                 resp.raise_for_status()
