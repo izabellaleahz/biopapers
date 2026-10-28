@@ -11,7 +11,7 @@ them across runs to count distinct sharers, and that file is public). Bots and a
 handle with "bot"/"arxiv" in it, or an account that shared many different papers in one run — are
 dropped: they post everything, so they say nothing about what's popular.
 Curated accounts (config/sources.yaml `buzz.x.people`: scientists whose picks are worth following) are
-also read whatever their likes, reposts and quotes included, and are never treated as aggregators;
+also read whatever their likes, reposts and quotes included (see people_queries), never treated as aggregators;
 their handles ship (`x_by`) and each counts double (build.buzz_score).
 HN and press return {doi: {...signal...}}; build.py merges all of them onto papers.
 """
@@ -101,32 +101,37 @@ X_COUNTS = "https://api.x.com/2/tweets/counts/recent"
 X_TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _x_query(terms: list[str], min_likes: int, reposts: bool = False) -> str:
+def _x_query(terms: list[str], min_likes: int, kind: str = "has:links -is:retweet") -> str:
     # Plain `url:"<domain>"` misses most publisher links in X's index (8 bioRxiv posts a week, against
     # 298 for the bare word), so the terms mix url: tokens and keywords — see config/sources.yaml.
-    q = "(" + " OR ".join(terms) + ") has:links" + ("" if reposts else " -is:retweet")
+    q = "(" + " OR ".join(terms) + ") " + kind
     return q + (f" min_likes:{min_likes}" if min_likes else "")
 
 
 X_QUERY_MAX = 512
+PEOPLE_KINDS = ("-is:reply", "is:reply has:links")
 
 
 def people_queries(cfg: dict) -> dict[str, dict]:
     """`buzz.x.people` ({"max_posts", "min_likes", "accounts": {group: [handles]}}) -> `from:` queries,
-    each group split evenly into as few as fit X's query length. Reposts count: a curated account
-    reposting a paper is its pick."""
+    each group split evenly into as few as fit X's query length. Not `has:links`: X doesn't count a
+    repost or quote as having links, and that's how these accounts mostly share papers (Kundaje: 207
+    posts a week, 148 reposts, 47 quotes, 0 "with links"). So: every post that isn't a reply (its
+    links, or those of the post it reposts or quotes), plus replies with a link (the paper link often
+    goes in the thread's first reply)."""
     out = {}
     for group, handles in (cfg.get("accounts") or {}).items():
         k = 1
         while True:
             chunks = [handles[i::k] for i in range(k)]
-            if all(len(_x_query([f"from:{h}" for h in c], 9999, True)) <= X_QUERY_MAX for c in chunks):
+            if all(len(_x_query([f"from:{h}" for h in c], 9999, PEOPLE_KINDS[1])) <= X_QUERY_MAX for c in chunks):
                 break
             k += 1
         for i, c in enumerate(chunks, 1):
-            out[f"{group} people" + (f" {i}" if k > 1 else "")] = {
-                "terms": [f"from:{h}" for h in c], "reposts": True,
-                "max_posts": cfg.get("max_posts", 150), "min_likes": cfg.get("min_likes", [0])}
+            for kind, label in zip(PEOPLE_KINDS, ("", " replies")):
+                out[f"{group} people" + (f" {i}" if k > 1 else "") + label] = {
+                    "terms": [f"from:{h}" for h in c], "kind": kind, "expand": True,
+                    "max_posts": cfg.get("max_posts", 100), "min_likes": cfg.get("min_likes", [0])}
     return out
 
 
@@ -176,8 +181,9 @@ def x(start: float, end: float, queries: dict[str, dict], log=print, curated: fr
     `queries` is {name: {"terms": [...], "max_posts": n, "min_likes": [n, ...]}}. X bills per post read,
     so each query first counts its posts (counts are billed per request, not per post) at each threshold
     and reads at the lowest one that fits `max_posts`: the whole popular set, not a sample. (Most-liked-
-    first ordering would be simpler, but X stops it after ~150 posts.) A query with "reposts" also takes
-    the links in the posts its posts repost or quote (an expansion, which X may bill as reads too)."""
+    first ordering would be simpler, but X stops it after ~150 posts.) A query's "kind" is its post
+    filter (default: original posts with links); one with "expand" also takes the links in the posts its
+    posts repost or quote (an expansion, which X may bill as reads too)."""
     token = os.environ.get("X_BEARER_TOKEN")
     if not token:
         log("    x: no X_BEARER_TOKEN, skipped")
@@ -198,7 +204,7 @@ def x(start: float, end: float, queries: dict[str, dict], log=print, curated: fr
             budget = q.get("max_posts", 300)
             counts = {}
             for likes in q.get("min_likes", [0]):
-                meta = call(c, X_COUNTS, name, {"query": _x_query(q["terms"], likes, q.get("reposts")),
+                meta = call(c, X_COUNTS, name, {"query": _x_query(q["terms"], likes, q.get("kind", "has:links -is:retweet")),
                                                 "granularity": "day", **window})
                 counts[likes] = meta.get("meta", {}).get("total_tweet_count", 0)
                 if counts[likes] <= budget:
@@ -207,10 +213,10 @@ def x(start: float, end: float, queries: dict[str, dict], log=print, curated: fr
                 log(f"    x {name}: {counts[likes]} posts even at {likes}+ likes — reading the newest {budget}")
             read, token_next = 0, None
             while read < budget:
-                params = {"query": _x_query(q["terms"], likes, q.get("reposts")), **window, "sort_order": "recency",
+                params = {"query": _x_query(q["terms"], likes, q.get("kind", "has:links -is:retweet")), **window, "sort_order": "recency",
                           "max_results": max(10, min(100, budget - read)),
-                          "tweet.fields": "public_metrics,entities,author_id" + (",referenced_tweets" if q.get("reposts") else ""),
-                          "expansions": "author_id" + (",referenced_tweets.id" if q.get("reposts") else ""),
+                          "tweet.fields": "public_metrics,entities,author_id" + (",referenced_tweets" if q.get("expand") else ""),
+                          "expansions": "author_id" + (",referenced_tweets.id" if q.get("expand") else ""),
                           "user.fields": "username"}
                 if token_next:
                     params["next_token"] = token_next
