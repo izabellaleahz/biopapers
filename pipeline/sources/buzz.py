@@ -14,6 +14,7 @@ HN and press return {doi: {...signal...}}; build.py merges all of them onto pape
 """
 
 import hashlib
+from collections import Counter
 import os
 import re
 import time
@@ -22,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import feedparser
 
 from ..common import BIORXIV_PREFIXES, client, find_doi, norm_doi
+from . import openalex
 
 PAPER_DOMAINS = ["biorxiv.org", "medrxiv.org", "nature.com", "science.org", "cell.com",
                  "arxiv.org", "doi.org", "pnas.org", "elifesciences.org",
@@ -101,6 +103,43 @@ def _x_query(terms: list[str], min_likes: int) -> str:
     return q + (f" min_likes:{min_likes}" if min_likes else "")
 
 
+NOT_PAPERS = re.compile(r"(^|\.)(x|twitter|youtube|youtu|instagram|linkedin|facebook|tiktok|github|bsky|"
+                        r"t|bit|google|wikipedia|reddit|substack|medium)\.[a-z]+$")
+MAX_TITLE_LOOKUPS = 400  # per pull (OpenAlex, free): links that carry no DOI, matched by their page title
+
+
+def _paper_ref(link: dict) -> str | None:
+    """A post's link -> a DOI, or "pmid:<id>" / "title:<page title>" to look up. expanded_url is the link
+    as posted; unwound_url follows redirects (doi.org -> the paper, but a ScienceDirect link -> its login
+    page), so both are tried."""
+    urls = [link.get("expanded_url") or "", link.get("unwound_url") or ""]
+    for u in urls:
+        if doi := doi_from_url(u):
+            return doi
+    for u in urls:
+        if m := re.search(r"pubmed\.ncbi\.nlm\.nih\.gov/(\d{6,9})", u):
+            return f"pmid:{m.group(1)}"
+    host = (re.match(r"https?://([^/]+)", urls[1] or urls[0]) or [None, ""])[1].lower()
+    if (title := (link.get("title") or "").strip()) and host and not NOT_PAPERS.search(host):
+        return f"title:{title}"
+    return None
+
+
+def _resolve(shares: list[tuple], log) -> list[tuple]:
+    """Shares whose ref is a PubMed id or page title -> their DOI (via OpenAlex); unresolved ones dropped."""
+    pmids = sorted({r[5:] for r, *_ in shares if r.startswith("pmid:")})
+    titles = [t for t, _ in Counter(r[6:] for r, *_ in shares if r.startswith("title:")).most_common(MAX_TITLE_LOOKUPS)]
+    try:
+        by_pmid = openalex.dois_for_pmids(pmids) if pmids else {}
+        by_title = openalex.dois_for_titles(titles) if titles else {}
+    except Exception as ex:
+        log(f"    x: resolving links failed ({ex.__class__.__name__}: {ex})")
+        by_pmid, by_title = {}, {}
+    log(f"    x: links without a DOI: {len(by_pmid)}/{len(pmids)} PubMed ids, {len(by_title)}/{len(titles)} page titles matched a paper")
+    ref = lambda r: by_pmid.get(r[5:]) if r.startswith("pmid:") else by_title.get(r[6:]) if r.startswith("title:") else r
+    return [(d, *rest) for r, *rest in shares if (d := ref(r))]
+
+
 def x(start: float, end: float, queries: dict[str, dict], log=print) -> dict[str, dict]:
     """Every X post between `start` and `end` (epoch seconds) linking to papers, above a like threshold.
     `queries` is {name: {"terms": [...], "max_posts": n, "min_likes": [n, ...]}}. X bills per post read,
@@ -148,18 +187,15 @@ def x(start: float, end: float, queries: dict[str, dict], log=print) -> dict[str
                 for t in posts:
                     m = t.get("public_metrics") or {}
                     eng = m.get("like_count", 0) + m.get("retweet_count", 0) + m.get("quote_count", 0)
-                    links = (t.get("entities") or {}).get("urls", [])
-                    # expanded_url is the link as posted; unwound_url follows redirects (doi.org -> the
-                    # paper, but also a ScienceDirect link -> its login page), so try both.
-                    dois = {d for u in links for k in ("expanded_url", "unwound_url") if (d := doi_from_url(u.get(k) or ""))}
-                    for doi in dois:
-                        handle = users.get(t["author_id"], "")
-                        shares.append((doi, t["author_id"], handle, eng,
+                    handle = users.get(t["author_id"], "")
+                    for ref in {r for u in (t.get("entities") or {}).get("urls", []) if (r := _paper_ref(u))}:
+                        shares.append((ref, t["author_id"], handle, eng,
                                        f"https://x.com/{handle or 'i'}/status/{t['id']}"))
                 if not (token_next := (data.get("meta") or {}).get("next_token")) or not posts:
                     break
             tried = ", ".join(f"{n}+ likes: {v}" for n, v in counts.items())
             log(f"    x {name}: counted {tried} · read {read} posts at {likes}+ likes")
+    shares = _resolve(shares, log)
     # Two days of posts: an account sharing 7+ different papers is an aggregator (or a journal's own).
     out = by_account(shares, "x", max_papers=6)
     for doi, _, _, eng, url in sorted(people(shares, 6), key=lambda s: s[3]):

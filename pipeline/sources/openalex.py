@@ -2,7 +2,10 @@
 
 import datetime as dt
 
-from ..common import client, make_paper, norm_doi, openalex_params, today
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+from ..common import client, get, make_paper, norm_doi, openalex_params, title_key, today
 
 API = "https://api.openalex.org/works"
 SELECT = ("doi,title,publication_date,type,authorships,abstract_inverted_index,"
@@ -61,18 +64,74 @@ def works_by_filter(flt: str, days: int, venue: str | None = None, max_pages: in
     return papers
 
 
+def _work_dois(w: dict) -> set[str]:
+    """Every DOI a work goes by. An arXiv paper's main DOI is often another registrant's (10.65215/...),
+    with the arXiv DOI only among its locations."""
+    dois = {norm_doi(w.get("doi"))}
+    for loc in w.get("locations") or []:
+        url = loc.get("landing_page_url") or ""
+        if m := re.search(r"arxiv\.org/abs/(\d{4}\.\d{4,5})", url):
+            dois.add(f"10.48550/arxiv.{m.group(1)}")
+        elif "doi.org/" in url:
+            dois.add(norm_doi(url))
+    return dois - {None}
+
+
 def lookup_dois(dois: list[str]) -> dict[str, dict]:
-    """{doi: paper} for every DOI OpenAlex knows. Batched 50 per request."""
+    """{doi: paper} for every DOI OpenAlex knows (the paper keyed and id'd by the DOI asked for).
+    Batched 50 per request."""
     found = {}
     with client() as c:
         for i in range(0, len(dois), 50):
             chunk = dois[i : i + 50]
             resp = c.get(API, params={
-                "filter": "doi:" + "|".join(chunk), "select": SELECT, "per-page": 50,
+                "filter": "doi:" + "|".join(chunk), "select": SELECT + ",locations", "per-page": 50,
                 **openalex_params(),
             })
             resp.raise_for_status()
             for w in resp.json()["results"]:
-                if (p := to_paper(w)) and (doi := norm_doi(w.get("doi"))):
-                    found[doi] = p
+                if not (p := to_paper(w)):
+                    continue
+                for doi in _work_dois(w) & set(chunk):
+                    found[doi] = {**p, "id": doi, "doi": doi,
+                                  **({"venue": "arXiv", "kind": "preprint", "url": f"https://arxiv.org/abs/{doi[16:]}"}
+                                     if doi.startswith("10.48550/arxiv.") else {})}
     return found
+
+
+def dois_for_pmids(pmids: list[str]) -> dict[str, str]:
+    """{PubMed id: DOI}. Batched 50 per request."""
+    out = {}
+    with client() as c:
+        for i in range(0, len(pmids), 50):
+            chunk = pmids[i : i + 50]
+            data = get(c, API, params={"filter": "ids.pmid:" + "|".join(chunk), "select": "doi,ids",
+                                       "per-page": 50, **openalex_params()}).json()
+            for w in data["results"]:
+                pmid = (w.get("ids") or {}).get("pmid", "").rsplit("/", 1)[-1]
+                if pmid and (doi := norm_doi(w.get("doi"))):
+                    out[pmid] = doi
+    return out
+
+
+def dois_for_titles(titles: list[str], workers: int = 8) -> dict[str, str]:
+    """{page title: DOI} for link titles that are a paper's title, give or take the site's name
+    ("<title> | Nature Medicine", "<title> - ScienceDirect"). Exact matches only: a news story about a
+    paper has its own headline, so it can't be mistaken for the paper."""
+    def one(c, title):
+        parts = [p.strip() for p in re.split(r"\s[|–—-]\s", title) if p.strip()]
+        guess = max(parts, key=len, default="")
+        if len(key := title_key(guess)) < 25:
+            return None
+        try:
+            data = get(c, API, tries=2, params={"search": guess, "per-page": 3, "select": "doi,title",
+                                                **openalex_params()}).json()
+        except Exception:
+            return None
+        for w in data.get("results", []):
+            if title_key(w.get("title") or "") == key and (doi := norm_doi(w.get("doi"))):
+                return doi
+        return None
+
+    with client() as c, ThreadPoolExecutor(workers) as pool:
+        return {t: d for t, d in zip(titles, pool.map(lambda t: one(c, t), titles)) if d}
