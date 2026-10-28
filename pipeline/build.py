@@ -402,11 +402,15 @@ def main() -> None:
                 papers[p["id"]]["ai"] = p["ai"]
     (OUT_DIR / "ai_pending.json").write_text(json.dumps({"batches": pending}))
 
+    ai_topics = lambda p: [t for t in (p.get("ai") or {}).get("topics", []) if tagger.section_of.get(t) == "bio"]
     filed = set()
     for p in untagged:
-        if topics := [t for t in (p.get("ai") or {}).get("topics", []) if tagger.section_of.get(t) == "bio"]:
+        if topics := ai_topics(p):
             p["topics"] = topics
             filed.add(p["id"])
+    for p in final:  # journal papers that made it on buzz alone: no rule tagged these either
+        if p["kind"] == "article" and not p["topics"] and (topics := ai_topics(p)):
+            p["topics"] = topics
     vecs, similar = {}, set()
     if "embed" in only:
         previous_vecs = {k: v for k, v in embed.load_previous(args.previous).items() if k not in refreshed}

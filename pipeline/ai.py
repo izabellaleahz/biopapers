@@ -51,7 +51,8 @@ def bio_topics() -> tuple[tuple[str, str], ...]:
     for t in load_config("topics")["topics"]:
         if t.get("section", "bio") == "bio":
             cats = ", ".join(t.get("categories", []))
-            out.append((t["slug"], f"{t['label']} ({cats})" if cats else t["label"]))
+            out.append((t["slug"], f"{t['label']} — {t['description']}" if t.get("description")
+                        else f"{t['label']} ({cats})" if cats else t["label"]))
     return tuple(out)
 
 

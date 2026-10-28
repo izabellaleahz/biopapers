@@ -16,6 +16,8 @@
 #                     (title + abstract), not just our feeds. Use for niche topics
 #                     where the papers are scattered across many journals.
 #
+#   description     — Bio tabs: what the tab covers, in a few words, for Claude when it files journal
+#                     papers no rule tagged (default: the label and categories)
 #   section         — "bio" (default) or "ml": which top-level section the tab lives in
 #   keep            — ML tabs only: keep the tab's papers the whole window, not just the firehose's
 #                     few days (for niche tabs with few papers and little social buzz)
@@ -46,6 +48,7 @@ topics:
   - slug: tcell
     label: Immunology / T cell
     color: "#a98fd6"
+    description: "Immunology broadly: T cells, innate immunity, inflammasomes, inflammation, cytokines, immunotherapy"
     categories: [immunology, allergy and immunology]
     venues: [Immunity, Nature Immunology, Science Immunology, JEM, Nature Reviews Immunology]
     keywords: ["T cell exhaustion", "regulatory T cell", "tissue-resident memory", "CAR T", "CAR-T",
@@ -88,6 +91,7 @@ topics:
   - slug: microbiology
     label: Micro & Viral
     color: "#5cc0a0"
+    description: "Microbiology and virology: bacteria, viruses, fungi, microbiomes, host-pathogen interactions"
     categories: [microbiology, infectious diseases]
     venues: [Nature Microbiology, Cell Host & Microbe, mBio, Journal of Virology, PLOS Pathogens]
     keywords: ["host-pathogen", "antiviral immun", "viral replication"]
@@ -113,6 +117,7 @@ topics:
   - slug: bioml
     label: Bio ML
     color: "#6bb6e6"
+    description: "Machine learning and computation for biology: protein design, foundation models, single-cell and genomics methods"
     categories: [bioinformatics, systems biology]
     arxiv: [q-bio]
     venues: [Nature Machine Intelligence, Cell Systems, PLOS Computational Biology, Nature Methods]
