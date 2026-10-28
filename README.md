@@ -58,8 +58,12 @@ All in `config/` — edit, push, and the next build picks it up (and re-tags eve
 | `config/profile.md` | Who the AI scorer is reading for — plain prose; edit it to change what counts as a must-read |
 
 **For You** is the home tab, with chips for Must read, ♥ Near favorites and each favorite label.
-In the site itself (⚙︎): ranking weights for For You (recency, AI score, buzz, PIs, similarity to
-your favorites and saves), recency half-life, tab order/visibility, per-topic weights,
+It's ranked by a small model of what you like: per paper, Claude's score, similarity to your *nearest*
+♥ favorite / saved paper / hidden paper (nearest, so separate interests don't blur), recency, buzz and
+watched PIs, combined with weights fitted in the browser to what you do (♥ ☆, take-homes and opening
+papers vs ✕ and papers you pass over), starting from — and regularised toward — the sliders in ⚙︎.
+The top is de-duplicated, every 7th slot goes to a strong paper outside your usual areas, and each
+card says why it's there. In the site itself (⚙︎): the starting weights (with the learned values), recency half-life, tab order/visibility, per-topic weights,
 export/import of your data, saved → BibTeX.
 
 ## AI scores, embeddings and the map

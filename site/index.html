@@ -69,7 +69,10 @@
 
       <section>
         <h3>“For You” ranking</h3>
-        <p class="hint">How much each signal counts. Applies to the For You sort in every tab.</p>
+        <p class="hint">Starting weights for each signal (the For You sort in every tab). Once you've ♥'d, saved
+          or opened a few papers, it fits the weights to what you actually do, starting from these. The learned
+          values are on the right.</p>
+        <p class="hint" id="learn-status"></p>
         <div id="weights"></div>
         <label class="row">Recency half-life
           <select id="halflife">

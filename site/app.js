@@ -8,8 +8,8 @@
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries"];
-const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks"];
+const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs", "learn"];
 const DAY = 86400000;
 const MUST_READ = 6; // AI score (0–10) at which a paper lands in "Must read"
 const NEAR_K = 25; // each favorite pulls its 25 most similar papers into "Near favorites"
@@ -29,13 +29,15 @@ const SECTION_TABS = {
 };
 const HOT_TABS = new Set(["buzz", "trending"]);
 
-const WEIGHTS = {
-  recency: { label: "Recency", def: 1 },
-  ai: { label: "AI relevance (Claude's 0–10 score for you)", def: 1 },
+// The ranking features, in the order features() returns them; `def` is the starting weight.
+const FEATURES = {
+  ai: { label: "Claude's relevance score", def: 1 },
+  fav: { label: "Near one of my ♥ favorites", def: 1 },
+  saved: { label: "Like papers I saved", def: 0.6 },
+  hidden: { label: "Like papers I marked not interested", def: -0.6, min: -2, max: 0 },
+  recency: { label: "New", def: 1 },
   buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
-  pi: { label: "Watched PIs", def: 1 },
-  affinity: { label: "Similar to my favorites and saves (less like what I mark not interested)", def: 0.8 },
-  vote: { label: "Saved by me", def: 0.3 },
+  pi: { label: "From a watched PI", def: 1 },
 };
 
 const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
@@ -44,7 +46,7 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 
 const defaults = () => ({
   votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, removed: {}, settingsAt: 0,
-  weights: Object.fromEntries(Object.entries(WEIGHTS).map(([k, w]) => [k, w.def])),
+  weights: Object.fromEntries(Object.entries(FEATURES).map(([k, w]) => [k, w.def])), learn: true, clicks: {},
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
   lastVisit: null, prevVisit: null, view: "feed", graphSection: "all", graphAround: true,
@@ -156,7 +158,7 @@ async function loadVectors() {
       let s = 0; for (let j = i * dim; j < (i + 1) * dim; j++) s += data[j] * data[j];
       norms[i] = Math.sqrt(s) || 1;
     }
-    VEC = { dim, data, norms, index: new Map(meta.ids.map((id, i) => [id, i])) };
+    VEC = { dim, data, norms, ids: [...meta.ids], index: new Map(meta.ids.map((id, i) => [id, i])) };
     affinityCache = nearCache = null;
     render({ keepPage: true });
     // Favorites the build hasn't embedded need the map loaded to be placed (Near favorites uses them too).
@@ -209,95 +211,196 @@ function similarTo(p, n = 20) {
 }
 
 // ---- ranking ---------------------------------------------------------------
+// For You is ranked by a small model of what you like. Each paper gets a few features in 0..1:
+// Claude's relevance score; how close it is to your nearest ♥ favorite, nearest saved paper and nearest
+// paper you marked not interested (nearest, not the average, so separate interests don't blur into
+// one); recency; buzz; a watched PI. Its score is a weighted sum. The weights start at the sliders in
+// ⚙︎ and are then fitted to what you actually do (♥, ☆, take-homes and clicking through, against ✕
+// and a sample of papers you scrolled past) by logistic regression pulled toward those starting
+// values, so a few clicks can't swing it. A paper never counts as similar to itself, so a saved paper
+// isn't scored "like your saves" because of itself, which keeps the fit honest.
 
-const STOP = new Set(("the and for with that this from are was were been into their which these those our " +
-  "using use used via between within across can may also show shows here than more most both such " +
-  "however whether while study studies data results result based new novel role analysis approach " +
-  "method methods model models cell cells human mice mouse").split(" "));
+const MAX_REFS = 150;      // the most recent saves / hides that count as references
+const MIN_POSITIVES = 8;   // below this, rank with the starting weights as they are
+const PRIOR_PULL = 0.03;   // L2 pull toward the starting weights
 
-function tokens(p) {
-  const text = `${p.title} ${p.title} ${(p.abstract || "").slice(0, 800)}`.toLowerCase();
-  const out = new Map();
-  for (const w of text.match(/[a-z][a-z0-9-]{2,}/g) || []) {
-    if (!STOP.has(w)) out.set(w, (out.get(w) || 0) + 1);
+// Max cosine from every embedded paper to a set of reference papers (the paper itself excluded),
+// with which reference was nearest. Adding a reference updates it in place (one pass over the vectors).
+class NearestSet {
+  constructor() { this.ids = new Set(); this.max = null; this.arg = null; this.n = -1; }
+  sync(ids) {
+    const n = VEC.index.size, want = new Set(ids.filter((id) => VEC.index.has(id)));
+    if (this.n !== n || [...this.ids].some((id) => !want.has(id))) {
+      this.ids = new Set(); this.n = n;
+      this.max = new Float32Array(n).fill(-1); this.arg = new Int32Array(n).fill(-1);
+    }
+    for (const id of want) if (!this.ids.has(id)) this.add(id);
   }
-  for (const t of p.topics || []) out.set(`#${t}`, 2);
-  return out;
+  add(id) {
+    const { dim, data, norms } = VEC, r = VEC.index.get(id), base = r * dim;
+    for (let i = 0; i < this.n; i++) {
+      if (i === r) continue;
+      let dot = 0; const b = i * dim;
+      for (let j = 0; j < dim; j++) dot += data[base + j] * data[b + j];
+      const s = dot / (norms[r] * norms[i]);
+      if (s > this.max[i]) { this.max[i] = s; this.arg[i] = r; }
+    }
+    this.ids.add(id);
+  }
+  // Raw cosines bunch up between ~0.6 and 0.95: stretch so the median paper is 0 and the top 0.5% is 1.
+  scale() {
+    if (!this.ids.size) return null;
+    const vals = []; const step = Math.max(1, Math.floor(this.n / 3000));
+    for (let i = 0; i < this.n; i += step) if (this.max[i] > -1) vals.push(this.max[i]);
+    vals.sort((a, b) => a - b);
+    return { lo: vals[Math.floor(vals.length * 0.5)] ?? 0, hi: vals[Math.floor(vals.length * 0.995)] ?? 1 };
+  }
+}
+const REF = { fav: new NearestSet(), saved: new NearestSet(), hidden: new NearestSet() };
+
+const recentIds = (map, n = MAX_REFS) => Object.entries(map).sort((a, b) => entryTs(b[1]) - entryTs(a[1])).slice(0, n).map(([id]) => id);
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+const hash32 = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619); return h >>> 0; };
+
+function features(p, rk, now) {
+  const r = VEC ? vecRow(p) : undefined;
+  const sim = (k) => (r === undefined || !rk.scale[k] || REF[k].max[r] < 0) ? 0
+    : clamp01((REF[k].max[r] - rk.scale[k].lo) / ((rk.scale[k].hi - rk.scale[k].lo) || 1));
+  const age = Math.max(0, (now - Date.parse(p.date)) / DAY);
+  return [
+    (p.ai?.score ?? 3) / 10,               // ai (unscored papers count as a middling 3)
+    sim("fav"), sim("saved"), sim("hidden"),
+    Math.pow(0.5, age / state.halfLife),   // recency
+    Math.min(1, Math.log1p(p.buzz_score || 0) / Math.log1p(20)),  // buzz
+    p.pis?.length ? 1 : 0,                 // pi
+  ];
 }
 
-let affinityCache = null; // Map(id -> 0..1), rebuilt when the corpus or likes change
+// Your signals: positives with a weight for how strong a sign each is, and negatives — papers you hid,
+// plus a fixed sample of papers you saw nothing in (3 per positive, at low weight).
+function trainingSet() {
+  const pos = new Map(), add = (ids, w) => { for (const id of ids) if (byId.has(id)) pos.set(id, Math.max(pos.get(id) || 0, w)); };
+  add(Object.keys(state.favorites), 3);
+  add(Object.keys(state.saved), 2);
+  add(Object.keys(state.summaries), 2);
+  add(Object.keys(state.clicks), 1);
+  const neg = new Map(Object.keys(state.hidden).filter((id) => byId.has(id) && !pos.has(id)).map((id) => [id, 2]));
+  const unlabeled = DATA.papers.filter((p) => !pos.has(p.id) && !neg.has(p.id) && !has(state.hidden, p))
+    .sort((a, b) => hash32(a.id) - hash32(b.id)).slice(0, Math.max(60, 3 * pos.size));
+  for (const p of unlabeled) neg.set(p.id, 0.5);
+  return { pos, neg };
+}
+
+function fitModel(rk) {
+  const prior = Object.keys(FEATURES).map((k) => state.weights[k] ?? FEATURES[k].def);
+  const { pos, neg } = trainingSet();
+  const stats = { positives: pos.size, hides: Object.keys(state.hidden).filter((id) => byId.has(id)).length };
+  if (!state.learn || pos.size < MIN_POSITIVES) return { w: prior, prior, learned: false, ...stats };
+  const now = Date.now(), X = [], y = [], wt = [];
+  for (const [id, w] of pos) { X.push(features(byId.get(id), rk, now)); y.push(1); wt.push(w); }
+  for (const [id, w] of neg) { X.push(features(byId.get(id), rk, now)); y.push(0); wt.push(w); }
+  const k = prior.length, total = wt.reduce((a, b) => a + b, 0);
+  const w = [...prior]; let b = 0;
+  for (let it = 0; it < 400; it++) {  // batch gradient descent; tiny problem
+    const g = new Array(k).fill(0); let gb = 0;
+    for (let i = 0; i < X.length; i++) {
+      let z = b; for (let j = 0; j < k; j++) z += w[j] * X[i][j];
+      const err = (1 / (1 + Math.exp(-z)) - y[i]) * wt[i] / total;
+      for (let j = 0; j < k; j++) g[j] += err * X[i][j];
+      gb += err;
+    }
+    for (let j = 0; j < k; j++) w[j] -= 1.0 * (g[j] + 2 * PRIOR_PULL * (w[j] - prior[j]));
+    b -= 1.0 * gb;
+  }
+  return { w, prior, learned: true, ...stats };
+}
+
+let affinityCache = null; // the ranker: { scale, w, … }; rebuilt when the corpus, vectors or your signals change
 let nearCache = null; // Map(id -> { fav, sim }) for "Near favorites", rebuilt alongside it
 
-function affinityScores() {
+function ranker() {
   if (affinityCache) return affinityCache;
-  const liked = new Set([...Object.keys(state.favorites), ...Object.keys(state.saved), ...Object.keys(state.votes)]);
-  affinityCache = new Map();
-  if (!liked.size) return affinityCache;
-  if (VEC && embeddingAffinity(liked)) return affinityCache;
-
-  const docs = DATA.papers.map((p) => [p.id, tokens(p)]);
-  const df = new Map();
-  for (const [, t] of docs) for (const w of t.keys()) df.set(w, (df.get(w) || 0) + 1);
-  const idf = (w) => Math.log((docs.length + 1) / ((df.get(w) || 0) + 1));
-  const vec = (t) => {
-    const v = new Map(); let n = 0;
-    for (const [w, c] of t) { const x = (1 + Math.log(c)) * idf(w); v.set(w, x); n += x * x; }
-    return [v, Math.sqrt(n) || 1];
-  };
-
-  // Profile = sum of liked papers' vectors (saved snapshots cover papers aged out of the window).
-  const profile = new Map();
-  for (const id of liked) {
-    const p = byId.get(id) || state.saved[id]?.paper || state.favorites[id]?.paper;
-    if (!p) continue;
-    const [v, n] = vec(tokens(p));
-    for (const [w, x] of v) profile.set(w, (profile.get(w) || 0) + x / n);
+  if (VEC) {
+    REF.fav.sync(Object.keys(state.favorites));
+    REF.saved.sync(recentIds(state.saved));
+    REF.hidden.sync(recentIds(state.hidden));
   }
-  let pn = 0; for (const x of profile.values()) pn += x * x; pn = Math.sqrt(pn) || 1;
-
-  let max = 0;
-  for (const [id, t] of docs) {
-    const [v, n] = vec(t);
-    let dot = 0; for (const [w, x] of v) dot += x * (profile.get(w) || 0);
-    const s = dot / (n * pn);
-    affinityCache.set(id, s); max = Math.max(max, s);
-  }
-  if (max > 0) for (const [id, s] of affinityCache) affinityCache.set(id, s / max);
+  const rk = { scale: VEC ? { fav: REF.fav.scale(), saved: REF.saved.scale(), hidden: REF.hidden.scale() } : {} };
+  affinityCache = Object.assign(rk, fitModel(rk));
   return affinityCache;
 }
 
-// Cosine to the mean of liked papers' embeddings, stretched so the median paper scores 0 and the
-// closest scores 1 (raw cosines bunch up between ~0.6 and 0.9). False if no liked paper has a vector.
-function embeddingAffinity(liked) {
-  const { dim, data, norms } = VEC, prof = new Float32Array(dim);
-  let any = false;
-  for (const id of liked) {
-    const r = VEC.index.get(id);
-    if (r === undefined) continue;
-    any = true;
-    for (let j = 0; j < dim; j++) prof[j] += data[r * dim + j] / norms[r];
+const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
+const rankScore = (p, rk, now) => topicWeight(p) * dot(rk.w, features(p, rk, now));
+
+// Re-rank the top of the list: spread out near-duplicates, and give every 7th slot (from the 5th) to a
+// strong paper (AI ≥ 6) unlike anything you've favorited or saved, so the feed doesn't narrow over time.
+const HEAD = 80, DUP_SIM = 0.8;
+let exploring = new Set();
+function diversify(scored, rk) {
+  exploring = new Set();
+  if (!VEC) return scored.map(([, p]) => p);
+  const head = scored.slice(0, HEAD), rest = scored.slice(HEAD);
+  const span = (head[0]?.[0] ?? 0) - (head[head.length - 1]?.[0] ?? 0) || 1, now = Date.now();
+  const rowOf = new Map(head.map(([, p]) => [p.id, vecRow(p)]));
+  const cos = (a, b) => {
+    const ra = rowOf.get(a.id), rb = rowOf.get(b.id);
+    if (ra === undefined || rb === undefined) return 0;
+    const { dim, data, norms } = VEC; let d = 0;
+    for (let j = 0; j < dim; j++) d += data[ra * dim + j] * data[rb * dim + j];
+    return d / (norms[ra] * norms[rb]);
+  };
+  const outside = scored.filter(([, p]) => (p.ai?.score ?? 0) >= 6
+    && (([, fav, saved]) => fav < 0.3 && saved < 0.3)(features(p, rk, now)));
+  const picked = [], left = [...head], used = new Set();
+  while (left.length) {
+    if (picked.length >= 4 && (picked.length - 4) % 7 === 0) {
+      const ex = outside.find(([, p]) => !used.has(p.id));
+      if (ex) { picked.push(ex[1]); used.add(ex[1].id); exploring.add(ex[1].id); continue; }
+    }
+    let best = -1, bestV = -Infinity;
+    for (let i = 0; i < left.length; i++) {
+      const [s, p] = left[i];
+      if (used.has(p.id)) continue;
+      const near = picked.slice(-12).reduce((m, q) => Math.max(m, cos(p, q)), 0);  // the recent few is enough
+      const v = s - (near > DUP_SIM ? span * 0.5 * (near - DUP_SIM) / (1 - DUP_SIM) : 0);
+      if (v > bestV) { bestV = v; best = i; }
+    }
+    if (best < 0) break;
+    const [, p] = left.splice(best, 1)[0];
+    picked.push(p); used.add(p.id);
   }
-  if (!any) return false;
-  // Push the profile away from what you marked not interested (the 200 most recent), at half weight.
-  const hidden = Object.entries(state.hidden).sort((a, b) => b[1] - a[1]).slice(0, 200)
-    .map(([id]) => VEC.index.get(id)).filter((r) => r !== undefined);
-  const nLiked = [...liked].filter((id) => VEC.index.has(id)).length;
-  for (const r of hidden) {
-    const wgt = 0.5 * nLiked / hidden.length;
-    for (let j = 0; j < dim; j++) prof[j] -= wgt * data[r * dim + j] / norms[r];
-  }
-  let pn = 0; for (const x of prof) pn += x * x; pn = Math.sqrt(pn) || 1;
-  const sims = [];
-  for (const p of DATA.papers) {
-    const r = vecRow(p);
-    if (r === undefined) continue;
-    let dot = 0; for (let j = 0; j < dim; j++) dot += prof[j] * data[r * dim + j];
-    sims.push([p.id, dot / (pn * norms[r])]);
-  }
-  const sorted = sims.map(([, s]) => s).sort((a, b) => a - b);
-  const lo = sorted[Math.floor(sorted.length / 2)] ?? 0, hi = sorted[sorted.length - 1] ?? 1;
-  for (const [id, s] of sims) affinityCache.set(id, Math.max(0, (s - lo) / ((hi - lo) || 1)));
-  return true;
+  return [...picked, ...rest.map(([, p]) => p).filter((p) => !used.has(p.id))];
+}
+
+// "Why it's here", from the two features that contribute most to this paper's score.
+function whyLine(p) {
+  if (exploring.has(p.id)) return `🧭 outside your usual areas · AI ${p.ai?.score}`;
+  const rk = affinityCache;
+  if (!rk) return "";
+  const x = features(p, rk, Date.now()), r = VEC ? vecRow(p) : undefined;
+  const nearest = (k) => (r === undefined || REF[k].arg[r] < 0) ? null : VEC.ids[REF[k].arg[r]];
+  const say = {
+    0: () => `AI ${p.ai?.score}`,
+    1: () => { const f = nearest("fav"); return f ? `near ♥ ${favLabel(f)}` : ""; },
+    2: () => { const s = nearest("saved"); return s ? `like “${shortTitle(favPaper(s)?.title || state.saved[s]?.paper?.title, 4)}” you saved` : ""; },
+    4: () => { const d = Math.round(Math.max(0, (Date.now() - Date.parse(p.date)) / DAY)); return d < 1 ? "today" : `${d}d old`; },
+    5: () => "buzzing",
+    6: () => `PI · ${p.pis[0]}`,
+  };
+  return x.map((v, j) => [rk.w[j] * v, j]).filter(([c, j]) => c > 0.15 && say[j])
+    .sort((a, b) => b[0] - a[0]).slice(0, 2).map(([, j]) => say[j]()).filter(Boolean).join(" · ");
+}
+
+// How well the ranking fits you: where your recent saves land in For You, among everything there.
+function rankFit(rk) {
+  const now = Date.now(), cut = now - 30 * DAY;
+  const recent = Object.entries(state.saved).filter(([id, s]) => entryTs(s) > cut && byId.has(id)).map(([id]) => byId.get(id));
+  if (recent.length < 3) return null;
+  const pool = DATA.papers.filter((p) => (sectionTopics(p).length || p.pis?.length || (p.ai?.score ?? 0) >= 4) && !has(state.hidden, p));
+  const scores = pool.map((p) => rankScore(p, rk, now)).sort((a, b) => b - a);
+  const top20 = scores[Math.min(19, scores.length - 1)];
+  return { n: recent.length, inTop20: recent.filter((p) => rankScore(p, rk, now) >= top20).length };
 }
 
 // For each favorite with an embedding, its NEAR_K most similar feed papers; a paper near several
@@ -335,18 +438,6 @@ function topicWeight(p) {
   const topics = sectionTopics(p);
   if (!topics.length) return 1;
   return Math.max(...topics.map((t) => state.topicWeights[t] ?? 1));
-}
-
-function score(p, aff, now) {
-  const w = state.weights;
-  const age = Math.max(0, (now - Date.parse(p.date)) / DAY);
-  const recency = Math.pow(0.5, age / state.halfLife);
-  const buzz = Math.min(1, Math.log1p(p.buzz_score || 0) / Math.log1p(20));
-  const pi = p.pis?.length ? 1 : 0;
-  const vote = has(state.votes, p) || has(state.saved, p) ? 1 : 0;
-  const ai = (p.ai?.score ?? 3) / 10; // unscored papers count as a middling 3
-  return topicWeight(p) * (w.recency * recency + w.ai * ai + w.buzz * buzz + w.pi * pi
-    + w.affinity * (aff.get(p.id) || 0) + w.vote * vote);
 }
 
 // ---- tabs / filtering -----------------------------------------------------------
@@ -410,10 +501,9 @@ function visiblePapers() {
     const hot = (p) => (p.buzz_score || 0) / Math.pow(Math.max(0, (now - Date.parse(p.date)) / DAY) + 2, 1.2);
     return list.sort((a, b) => hot(b) - hot(a) || b.date.localeCompare(a.date));
   }
-  const aff = state.weights.affinity > 0 ? affinityScores() : new Map();
-  const now = Date.now();
-  const scored = list.map((p) => [score(p, aff, now), p]);
-  return scored.sort((a, b) => b[0] - a[0]).map(([, p]) => p);
+  const rk = ranker(), now = Date.now();
+  const scored = list.map((p) => [rankScore(p, rk, now), p]).sort((a, b) => b[0] - a[0]);
+  return ui.query ? scored.map(([, p]) => p) : diversify(scored, rk);
 }
 
 // ---- rendering ---------------------------------------------------------------
@@ -489,6 +579,8 @@ const fmtK = (n) => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : S
 const link = (href, text, title = "") =>
   `<a href="${esc(href)}" target="_blank" rel="noopener"${title ? ` title="${esc(title)}"` : ""}>${text}</a>`;
 
+const showWhy = (p) => state.view !== "graph" && curTab() !== "saved" && sortFor(curTab()) === "foryou" && !!whyLine(p);
+
 function card(p) {
   // Current section's topics first, so the card edge matches the tab you're in.
   const topics = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t)).filter(Boolean)
@@ -537,6 +629,7 @@ function card(p) {
         ${topics.map((t) => `<span class="badge" style="--c:${t.color}"${p.tagged_by ? ` title="Tagged from similar papers (no keyword matched)"` : ""}>${esc(t.label)}</span>`).join("")}
       </div>
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
+      ${showWhy(p) ? `<div class="why-line">${esc(whyLine(p))}</div>` : ""}
       ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
       ${p.abstract ? `<div class="abstract">${esc(p.abstract)}</div>` : ""}
       ${takehomeHTML(p)}
@@ -569,6 +662,8 @@ function toggleFavorite(p) {
 }
 
 $("feed").addEventListener("click", (e) => {
+  const opened = e.target.closest(".paper h3 a");
+  if (opened) { state.clicks[opened.closest(".paper").dataset.id] = Date.now(); affinityCache = null; persist(); return; }
   const abs = e.target.closest(".abstract");
   if (abs) { abs.classList.toggle("open"); return; }
   const btn = e.target.closest("button[data-act]");
@@ -860,7 +955,7 @@ function addToGraph(id, vec) {
   const top = sims.sort((a, b) => b[0] - a[0]).slice(0, 8);
   let x = 0, y = 0, w = 0;
   for (const [sim, i] of top) { const k = Math.max(sim, 0) ** 4; x += MAP.xy[i][0] * k; y += MAP.xy[i][1] * k; w += k; }
-  VEC = { ...VEC, data, norms }; VEC.index.set(id, n);
+  VEC = { ...VEC, data, norms }; VEC.index.set(id, n); VEC.ids.push(id);
   MAP.ids.push(id); MAP.xy.push([x / (w || 1), y / (w || 1)]); MAP.nn.push(top.map(([, i]) => i)); MAP.index.set(id, n);
   MAP.c?.push(MAP.c[top[0][1]]);
 }
@@ -1243,11 +1338,18 @@ $("or-box").addEventListener("change", (e) => {
 // ---- settings ---------------------------------------------------------------
 
 function renderSettings() {
-  $("weights").innerHTML = Object.entries(WEIGHTS).map(([k, w]) => `
-    <label class="row">${esc(w.label)}
-      <input type="range" min="0" max="2" step="0.1" value="${state.weights[k]}" data-weight="${k}">
-      <output>${(+state.weights[k]).toFixed(1)}</output>
+  const rk = ranker(), fit = rk.learned ? rankFit(rk) : null;
+  $("weights").innerHTML = Object.entries(FEATURES).map(([k, f], j) => `
+    <label class="row">${esc(f.label)}
+      <input type="range" min="${f.min ?? 0}" max="${f.max ?? 2}" step="0.1" value="${state.weights[k] ?? f.def}" data-weight="${k}">
+      <output>${(+(state.weights[k] ?? f.def)).toFixed(1)}</output>
+      <span class="learned" title="What it learned from your activity">${rk.learned ? `→ ${rk.w[j].toFixed(1)}` : ""}</span>
     </label>`).join("");
+  $("learn-status").innerHTML = `<label><input type="checkbox" id="learn" ${state.learn ? "checked" : ""}> Learn from my activity</label> · ${
+    !state.learn ? "using the starting weights as set"
+    : rk.learned ? `fitted to ${rk.positives} papers you ♥ / ☆ / opened and ${rk.hides} you hid${
+        fit ? ` · ${fit.inTop20} of your ${fit.n} saves from the last month rank in For You's top 20` : ""}`
+    : `needs ${MIN_POSITIVES - rk.positives} more ♥ / ☆ / opened papers before it starts adjusting (${rk.positives} so far)`}`;
   $("halflife").value = String(state.halfLife);
   renderSync();
   renderTakehomeSettings();
@@ -1274,9 +1376,13 @@ $("weights").addEventListener("input", (e) => {
   if (!k) return;
   state.weights[k] = +e.target.value;
   e.target.nextElementSibling.textContent = (+e.target.value).toFixed(1);
+  affinityCache = null;
   persist();
 });
-$("halflife").addEventListener("change", (e) => { state.halfLife = +e.target.value; persist(); });
+$("halflife").addEventListener("change", (e) => { state.halfLife = +e.target.value; affinityCache = null; persist(); });
+$("learn-status").addEventListener("change", (e) => {
+  if (e.target.id === "learn") { state.learn = e.target.checked; affinityCache = null; persist(); renderSettings(); }
+});
 
 $("tab-editor").addEventListener("input", (e) => {
   const li = e.target.closest("li"); if (!li) return;
