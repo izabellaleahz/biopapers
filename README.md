@@ -170,8 +170,10 @@ committing data. Optional repo secrets/variables:
   it finds what's popular but skips the long tail of barely-liked posts. bioRxiv is rare on X (~30 posts a
   week with 5+ likes); bio attention there is mostly journal papers. Buzz counts
   distinct people sharing a paper on X (accumulated across days in `buzz_state.json`), not posts,
-  and drops bots/aggregators. Off-topic papers only reach Trending if OpenAlex files them under biology
-  or CS.
+  and drops bots/aggregators. A curated list of scientists (`buzz.x.people` in `config/sources.yaml`)
+  is read in full, reposts included, and each of them counts as two people. Trending ages a paper from
+  when people last talked about it, not from its publication date. Off-topic papers only reach Trending
+  if OpenAlex files them under biology or CS.
 - **Abstracts:** Nature/Science/Cell RSS give short summaries; we backfill from OpenAlex,
   which often has no abstract for Elsevier/Springer papers.
 - **Window:** 30 days for the general feed, 180 days for watched PIs (the archive keeps everything). The ML arXiv firehose

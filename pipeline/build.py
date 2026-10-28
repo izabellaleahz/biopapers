@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from .common import ROOT, client, load_config, read_gist_state, strip_label, title_key, today
+from .common import ROOT, client, load_config, norm_doi, read_gist_state, strip_label, title_key, today
 from . import ai, archive, embed, favorites, layout, tagging, users
 from .sources import buzz, europepmc, huggingface, journals, openalex, preprints
 from .tagging import Tagger
@@ -40,8 +40,9 @@ ALERTS_PATH = ROOT / "site" / "alerts.xml"
 ALL_SOURCES = ["biorxiv", "medrxiv", "arxiv", "rss", "openalex", "search", "pis", "ml", "hf", "buzz",
                "embed", "ai"]  # the last two are enrichment steps, not sources
 BUZZ_ALERT_SCORE = 8       # bio: e.g. 6 people sharing it, ~100 HN points, or 3 press stories (see buzz_score)
-BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~12 people sharing it or ~800 HF upvotes — ML gets far more attention
+BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~7 people sharing it, plus HN or HF upvotes — ML gets far more attention
 BUZZ_STATE_DAYS = 30       # forget who shared a paper this long after anyone last did
+BUZZ_REVIVE = 5            # a paper over a month old counts as hot again only with this much buzz (~3 people)
 BIO_DOMAINS = {"Life Sciences", "Health Sciences"}  # OpenAlex domains that make a stray buzzing paper "bio"
 MAX_AUTHORS = 13  # keep first 10 + last 3 (PIs are usually last)
 MAX_ABSTRACT = 1500
@@ -161,7 +162,9 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger,
                 log(f"  buzz x: last pulled {x_hours:.0f}h ago, skipped")
             elif end > start + 3600:
                 def pull_x():
-                    out = buzz.x(start, end, xc["queries"], log)
+                    crowd = xc.get("people") or {}
+                    out = buzz.x(start, end, {**xc["queries"], **buzz.people_queries(crowd)}, log,
+                                 buzz.curated_handles(crowd))
                     if os.environ.get("X_BEARER_TOKEN"):  # it ran (a failure raises): the posts are billed
                         iso = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")
                         buzz_state["x_last"], buzz_state["x_until"] = iso(now), iso(end)
@@ -258,14 +261,16 @@ def enrich_abstracts(papers: dict[str, dict]) -> set[str]:
 
 
 def buzz_score(b: dict, hf: dict | None) -> float:
-    """How much attention a paper is getting. Breadth first: each person sharing it counts 1, scaled up
-    to ~2-3x by how much engagement their posts got, so ten people sharing a paper beat one big account
-    with 300 likes. HN points and HF upvotes count on a log scale (both run into the hundreds)."""
+    """How much attention a paper is getting. Breadth first: each person sharing it counts 1 (a curated
+    account, 2), scaled up to ~2-3x by how much engagement their posts got, so ten people sharing a
+    paper beat one big account with 300 likes. HN points and HF upvotes count on a log scale (both run
+    into the hundreds); HF's lightly — upvotes there come mostly from the authors' own circle, so ~300
+    count about as much as two people on X."""
     def shared(n, eng):
         return n * (1 + math.log10(1 + eng / n) / 2) if n else 0
-    return round(shared(b.get("x", 0), b.get("x_likes", 0))
+    return round(shared(b.get("x", 0) + len(b.get("x_by", [])), b.get("x_likes", 0))
                  + 4 * math.log10(1 + b.get("hn", 0)) + 3 * len(b.get("news", []))
-                 + 3 * math.log2(1 + (hf or {}).get("upvotes", 0) / 25), 2)
+                 + 1.25 * math.log2(1 + (hf or {}).get("upvotes", 0) / 25), 2)
 
 
 SOCIAL = ("x",)
@@ -273,10 +278,21 @@ SOCIAL = ("x",)
 
 def apply_buzz(papers: dict[str, dict], signals: dict[str, dict], state: dict[str, dict]) -> None:
     """Fold this run's signals into the papers. Who shared a paper on X accumulates in `state`
-    ({doi: {"x": {account: engagement}, "seen": date}}) across runs, so a paper shared
-    by different people on different days adds up, and a later sighting of a post updates its likes.
-    HN points and press stories are a fresh read each run."""
+    ({doi: {"x": {account: engagement}, "x_by": [curated handles], "seen": date}}) across runs, so a
+    paper shared by different people on different days adds up, and a later sighting of a post updates
+    its likes. HN points and press stories are a fresh read each run. `buzz_at` is when the attention
+    was last fresh (the latest X pull that found a share, the HN story, the press story), so Trending ages
+    a paper from when people talked about it, not from when it came out — unless it's old and only a
+    person or two brought it up (one tweet of a 2018 paper isn't a trend)."""
     now = today().isoformat()
+    for old in [d for d in state if norm_doi(d) != d]:  # keys from before a norm_doi fix
+        st, into = state.pop(old), state.setdefault(norm_doi(old), {})
+        for net in SOCIAL:
+            for acct, eng in st.get(net, {}).items():
+                into.setdefault(net, {})[acct] = max(into.get(net, {}).get(acct, 0), eng)
+        into["seen"] = max(into.get("seen", ""), st.get("seen", ""))
+        if st.get("x_top", -1) > into.get("x_top", -1):
+            into["x_url"], into["x_top"] = st.get("x_url"), st["x_top"]
     for doi, sig in signals.items():
         if any(sig.get(net) for net in SOCIAL):
             st = state.setdefault(doi, {})
@@ -287,24 +303,35 @@ def apply_buzz(papers: dict[str, dict], signals: dict[str, dict], state: dict[st
                     accts[acct] = max(accts.get(acct, 0), eng)
             if sig.get("x_url") and (top := max(sig["x"].values())) >= st.get("x_top", -1):
                 st["x_url"], st["x_top"] = sig["x_url"], top
+            if sig.get("x_by"):
+                st["x_by"] = sorted(set(st.get("x_by", [])) | set(sig["x_by"]), key=str.lower)
         if p := papers.get(doi):
-            p["buzz"] = {**(p.get("buzz") or {}), **{k: v for k, v in sig.items() if k not in SOCIAL and k != "x_url"}}
+            p["buzz"] = {**(p.get("buzz") or {}),
+                         **{k: v for k, v in sig.items() if k not in SOCIAL and k not in ("x_url", "x_by")}}
     cut = (today() - dt.timedelta(days=BUZZ_STATE_DAYS)).isoformat()
     for doi in [d for d, st in state.items() if st.get("seen", "") < cut]:
         del state[doi]
     for p in papers.values():
         # Shares only ever come from the state (older records also carry dropped Bluesky counts).
-        b = {k: v for k, v in (p.get("buzz") or {}).items() if k not in ("x", "x_likes", "x_url", "bsky", "bsky_likes")}
+        b = {k: v for k, v in (p.get("buzz") or {}).items()
+             if k not in ("x", "x_likes", "x_url", "x_by", "bsky", "bsky_likes")}
+        st = state.get(p.get("doi") or "") or {}
         for net in SOCIAL:
-            if accts := (state.get(p.get("doi") or "") or {}).get(net):
+            if accts := st.get(net):
                 b[net], b[f"{net}_likes"] = len(accts), sum(accts.values())
-        if url := (state.get(p.get("doi") or "") or {}).get("x_url"):
-            b["x_url"] = url
+        for k in ("x_url", "x_by"):
+            if st.get(k):
+                b[k] = st[k]
         if b:
             p["buzz"] = b
         else:
             p.pop("buzz", None)
         p["buzz_score"] = buzz_score(b, p.get("hf"))
+        fresh = max([st.get("seen", "") if st.get("x") else "", b.get("hn_at", ""), b.get("news_at", "")])
+        if p["buzz_score"] and fresh > p["date"] and (p["date"] >= cut or p["buzz_score"] >= BUZZ_REVIVE):
+            p["buzz_at"] = fresh
+        else:
+            p.pop("buzz_at", None)
 
 
 def dedup_versions(papers: dict[str, dict]) -> dict[str, dict]:
@@ -325,8 +352,9 @@ def dedup_versions(papers: dict[str, dict]) -> dict[str, dict]:
             keep["added"] = min(r.get("added", r["date"]) for r in group)
             top = max(group, key=lambda r: r.get("buzz_score", 0))  # the version people are sharing
             keep["buzz_score"] = top.get("buzz_score", 0)
-            if top.get("buzz"):
-                keep["buzz"] = top["buzz"]
+            for k in ("buzz", "buzz_at"):
+                if top.get(k):
+                    keep[k] = top[k]
         out[keep["id"]] = keep
     return out
 

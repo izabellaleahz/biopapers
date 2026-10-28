@@ -689,8 +689,9 @@ function visiblePapers() {
   if (sort === "date") return list.sort((a, b) => b.date.localeCompare(a.date) || (b.buzz_score || 0) - (a.buzz_score || 0));
   if (sort === "buzz") {
     // "Hot": attention decayed by age (HN-style gravity), so this week's breakout beats last month's.
+    // Age counts from when people last talked about it (buzz_at), so an older paper going viral now is hot.
     const now = Date.now();
-    const hot = (p) => (p.buzz_score || 0) / Math.pow(Math.max(0, (now - Date.parse(p.date)) / DAY) + 2, 1.2);
+    const hot = (p) => (p.buzz_score || 0) / Math.pow(Math.max(0, (now - Date.parse(p.buzz_at || p.date)) / DAY) + 2, 1.2);
     return list.sort((a, b) => hot(b) - hot(a) || b.date.localeCompare(a.date));
   }
   const rk = ranker(), now = Date.now();
@@ -907,6 +908,7 @@ function card(p) {
     hf.upvotes && arxivId ? `<a class="badge hot" href="https://huggingface.co/papers/${esc(arxivId)}" target="_blank" rel="noopener" title="Hugging Face Daily Papers upvotes">▲ ${hf.upvotes} HF</a>` : "",
     b.hn ? `<a class="badge hot" href="${esc(b.hn_url)}" target="_blank" rel="noopener" title="Hacker News points">HN ${b.hn}</a>` : "",
     b.x ? `<a class="badge hot" href="${esc(b.x_url || "#")}" target="_blank" rel="noopener" title="People sharing this on X (likes+reposts: ${b.x_likes || 0}) — opens the most-liked post">X ${b.x}</a>` : "",
+    ...(b.x_by || []).slice(0, 2).map((h) => `<a class="badge hot" href="https://x.com/${esc(h)}" target="_blank" rel="noopener" title="Shared on X by @${esc(h)}, one of the accounts Trending follows">@${esc(h)}</a>`),
     ...(b.news || []).slice(0, 2).map((n) => `<a class="badge hot" href="${esc(n.url)}" target="_blank" rel="noopener" title="${esc(n.title)}">press</a>`),
   ].join("");
 

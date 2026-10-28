@@ -153,3 +153,23 @@ buzz:
         min_likes: [10, 20, 50, 100]
         terms: ['url:"arxiv.org"', 'url:"huggingface.co/papers"', 'alphaxiv', 'url:ieee', 'url:acm', 'url:mlr',
                 'url:neurips']
+    # Scientists whose shares are a pick worth following: every post of theirs with a link (reposts and
+    # quotes too) is read whatever its likes, never capped as an aggregator, and counts as two people
+    # (buzz.people_queries; the card shows the handle). Groups are only for the budget: sections still
+    # come from the paper. Each pull logs which of these shared nothing — a handle that's always silent
+    # is wrong or gone quiet on X; drop it. Pure aggregators (@_akhaliq, @arankomatsuzaki) don't belong:
+    # they post every paper, so their pick says nothing. At most 4 × 100 posts a pull (≈ $1/day, plus
+    # the posts they repost or quote, if X bills those expansions as reads).
+    people:
+      max_posts: 100    # per query (each group splits into two); above it, only posts with 20+ / 100+ likes
+      min_likes: [0, 20, 100]
+      accounts:
+        bio: [anshulkundaje, genophoria, lpachter, EricTopol, sokrypton, MoAlQuraishi, pdhsu, BrianHie,
+              KevinKaichuang, BoWang87, marinkazitnik, james_y_zou, fabian_theis, jure, ElliotHershberg,
+              jbloom_lab, VirusesImmunity, profshanecrotty, SashaGusevPosts, arjunrajlab, mbeisen,
+              GreeneScientist, michaelhoffman, slavov_n, erlichya, segal_eran, SGRodriques, atulbutte,
+              dgmacarthur, Dereklowe, carlzimmer, kakape]
+        cs: [karpathy, rasbt, omarsar0, jxmnop, natolambert, srush_nlp, hardmaru, DrJimFan, jeremyphoward,
+             Thom_Wolf, giffmana, percyliang, chrmanning, tri_dao, chelseabfinn, svlevine, YiTayML, lilianweng,
+             NeelNanda5, ch402, fchollet, emollick, cHHillee, kchonyc, yoavgo, _jasonwei, sarahookr,
+             polynoamial, DimitrisPapail]

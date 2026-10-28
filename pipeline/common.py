@@ -92,8 +92,12 @@ def norm_doi(doi: str | None) -> str | None:
         return None
     doi = doi.strip().lower()
     doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", doi)
-    doi = re.sub(r"v\d+$", "", doi) if doi.startswith(BIORXIV_PREFIXES) else doi  # bioRxiv version suffix
-    return doi.rstrip(".,;)") or None
+    if doi.startswith(BIORXIV_PREFIXES):  # just the id: no version suffix (v2) or page cruft after it
+        doi = m.group(0) if (m := re.match(r"10\.\d+/(\d{4}\.\d\d\.\d\d\.)?\d{6,}", doi)) else doi
+    # Trailing punctuation from the surrounding text, but not a DOI's own closing parenthesis (…5.2(9)).
+    while doi and (doi[-1] in ".,;" or (doi[-1] == ")" and doi.count(")") > doi.count("("))):
+        doi = doi[:-1]
+    return doi or None
 
 
 def title_key(title: str) -> str:
