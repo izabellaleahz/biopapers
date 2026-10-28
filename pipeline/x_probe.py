@@ -4,15 +4,12 @@ import time
 
 from .common import client
 
-QUERIES = [
-    "from:EricTopol", "from:EricTopol has:links", "from:EricTopol has:links -is:retweet",
-    "from:EricTopol is:retweet", "from:EricTopol is:quote",
-    "from:karpathy", "from:karpathy has:links", "from:anshulkundaje", "from:anshulkundaje has:links",
-    "from:genophoria", "from:lpachter", "from:omarsar0", "from:omarsar0 has:links", "from:emollick has:links",
-    "(from:EricTopol OR from:karpathy OR from:omarsar0) has:links",
-    "(from:EricTopol OR from:karpathy OR from:omarsar0)",
-    "from:EricTopol url:\"doi.org\"", "from:omarsar0 url:\"arxiv.org\"",
-]
+import yaml
+from .sources import buzz
+GROUPS = [" OR ".join(v["terms"]) for v in buzz.people_queries(yaml.safe_load(open("config/sources.yaml"))["buzz"]["x"]["people"]).values()]
+FILTERS = ["", "-is:reply", "-is:reply -is:retweet", "is:retweet", "is:quote", "has:links", "is:reply has:links",
+           "-is:reply (has:links OR is:quote OR is:retweet)"]
+QUERIES = [f"(from:anshulkundaje) {f}".strip() for f in FILTERS] + [f"({g}) {f}".strip() for g in GROUPS for f in FILTERS]
 
 with client() as c:
     c.headers["Authorization"] = f"Bearer {os.environ['X_BEARER_TOKEN']}"
@@ -20,4 +17,4 @@ with client() as c:
     for q in QUERIES:
         r = c.get("https://api.x.com/2/tweets/counts/recent", params={"query": q, "granularity": "day", "start_time": start})
         total = r.json().get("meta", {}).get("total_tweet_count") if r.is_success else f"HTTP {r.status_code} {r.text[:200]}"
-        print(f"{str(total):>8}  {q}", flush=True)
+        print(f"{str(total):>8}  {q[:60]} … {q[-50:]}", flush=True)
