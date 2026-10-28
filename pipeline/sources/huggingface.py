@@ -4,6 +4,8 @@ trending). Free JSON API, no key. ~60–100 papers per weekday."""
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
+
 from ..common import client, get, make_paper, today
 
 API = "https://huggingface.co/api/daily_papers"
@@ -45,7 +47,14 @@ def fetch_daily(days: int) -> list[dict]:
     dates = [(today() - dt.timedelta(days=i)).isoformat() for i in range(days)]
     with client() as c:
         def one(d):
-            return get(c, API, params={"date": d, "limit": 100}).json()
+            # A day that isn't published yet (an early-UTC build asking for "today") is a 400: skip
+            # that day rather than lose the whole week.
+            try:
+                return get(c, API, params={"date": d, "limit": 100}, tries=2).json()
+            except httpx.HTTPStatusError as ex:
+                if ex.response.status_code == 400:
+                    return []
+                raise
 
         with ThreadPoolExecutor(6) as pool:
             items = [x for batch in pool.map(one, dates) for x in batch]
