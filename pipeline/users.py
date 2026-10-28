@@ -11,6 +11,8 @@ Needs SUPABASE_SERVICE_KEY (an Actions secret); without it this returns nothing.
 
 import os
 
+import httpx
+
 from .common import client
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uywohcjbluxrtqwphouk.supabase.co")
@@ -24,7 +26,7 @@ def _headers(key: str) -> dict:
 
 def watched_pis(known: list[dict], log) -> list[dict]:
     """Users' PIs not already in `known` (people.yaml), as people.yaml-style {"name", "openalex"}."""
-    key = os.environ.get("SUPABASE_SERVICE_KEY")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()  # a pasted secret can carry a newline
     if not key:
         return []
     rows, page = [], 1000
@@ -37,6 +39,9 @@ def watched_pis(known: list[dict], log) -> list[dict]:
                 rows += resp.json()
                 if len(resp.json()) < page:
                     break
+    except httpx.HTTPStatusError as ex:  # Supabase's message names the problem ("Invalid API key"), never the key
+        log(f"  user PIs: couldn't read from Supabase ({ex.response.status_code}: {ex.response.text[:200]})")
+        return []
     except Exception as ex:
         log(f"  user PIs: couldn't read from Supabase ({ex.__class__.__name__})")
         return []
