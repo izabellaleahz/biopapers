@@ -21,7 +21,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://uywohcjbluxrtqwphouk.supa
 def _headers(key: str) -> dict:
     # New-style secret keys (sb_secret_…) go in `apikey` only; a legacy service_role JWT also needs
     # to be the bearer token for PostgREST to use its role.
-    return {"apikey": key} if key.startswith("sb_") else {"apikey": key, "Authorization": f"Bearer {key}"}
+    # And not the shared client's "Mozilla/…" User-Agent: Supabase refuses a secret key from anything
+    # that looks like a browser.
+    auth = {"apikey": key} if key.startswith("sb_") else {"apikey": key, "Authorization": f"Bearer {key}"}
+    return {**auth, "User-Agent": "biopapers-build (python-httpx)"}
 
 
 def watched_pis(known: list[dict], log) -> list[dict]:
