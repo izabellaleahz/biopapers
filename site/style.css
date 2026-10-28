@@ -203,3 +203,16 @@ body.graph-mode #tabs, body.graph-mode #chips, body.graph-mode #sortbar, body.gr
 .toast button { cursor:pointer; border:1px solid color-mix(in srgb, var(--bg) 35%, transparent); background:transparent; color:inherit; border-radius:8px; padding:3px 9px; font-size:12px; }
 .toast button:hover { background:color-mix(in srgb, var(--bg) 15%, transparent); }
 .toast .undo { border:0; text-decoration:underline; }
+
+/* ---- account ---- */
+.acctbtn { cursor:pointer; border:1px solid var(--line); background:var(--card); color:inherit; border-radius:999px; padding:6px 12px; font-size:13px; white-space:nowrap; }
+.acctbtn.signed-in { width:34px; height:34px; padding:0; border-radius:50%; font-weight:700; background:var(--accent); color:#fff; border-color:var(--accent); }
+#account-box textarea { width:100%; box-sizing:border-box; border:1px solid var(--line); background:var(--bg); color:inherit; border-radius:8px; padding:8px 10px; font:inherit; font-size:13px; margin:6px 0 8px; resize:vertical; }
+#account-box .btnrow + .btnrow { margin-top:8px; }
+#account-box input[type=email] { flex:1 1 200px; min-width:0; border:1px solid var(--line); background:var(--bg); color:inherit; border-radius:8px; padding:5px 10px; font-size:13px; }
+@media (max-width:560px) {
+  header { flex-wrap:wrap; }
+  header > div:first-child { flex:1 1 0; min-width:0; }
+  header .sections { order:3; flex:1 1 100%; }   /* Bio | ML / CS | Graph gets its own row */
+}
+.badge.venue { max-width:min(100%, 280px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

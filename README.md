@@ -100,6 +100,17 @@ export/import of your data, saved → BibTeX.
   `BIOPAPERS_GIST_ID` the daily build also picks favorites up (for the AI scorer and other devices);
   those are published in `data/favorites.json` like the rest of the site's data.
 
+## Accounts (Supabase)
+
+Invite-only accounts for a few people, on a free Supabase project (sign-ups off; invite people under
+Authentication → Users). Signed in, your saves / favorites / hides / settings sync to your own row
+(`user_state`, merged per entry with a revision check so two devices can't overwrite each other),
+take-homes to `summaries`, and your interests text, what Claude scores papers for, lives on your
+profile (⚙︎ → Account). Every table has row-level security: each person reads and writes only their
+own rows. The site holds only the publishable key; the build fails if a secret key shows up in
+`site/`. Schema: `backend/supabase/schema.sql` (run once in the SQL editor). Signed out, the site works
+as before, with optional Gist sync.
+
 ## Run locally
 
 ```bash

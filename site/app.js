@@ -53,9 +53,15 @@ const defaults = () => ({
   lastVisit: null, prevVisit: null, view: "feed", graphSection: "all", graphAround: true,
 });
 
+// Who's signed in (see the accounts section). Each signed-in user has their own copy of the state in
+// this browser; signed out uses the plain key.
+const account = { user: null, profile: null, error: null };
+const uid = () => account.user?.id;
+const storeKey = () => (account.user ? `${STORE_KEY}:${account.user.id}` : STORE_KEY);
+
 function loadState() {
   try {
-    const raw = localStorage.getItem(STORE_KEY);
+    const raw = localStorage.getItem(storeKey());
     if (!raw) return defaults();
     const saved = JSON.parse(raw), d = defaults();
     return { ...d, ...saved, weights: { ...d.weights, ...saved.weights } }; // new weights get their default
@@ -71,7 +77,7 @@ const settingsJSON = (s) => JSON.stringify(SYNC_SETTINGS.map((k) => s[k]));
 let settingsSeen = settingsJSON(state);
 
 function saveLocal() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* private mode etc. */ }
+  try { localStorage.setItem(storeKey(), JSON.stringify(state)); } catch { /* private mode etc. */ }
 }
 function persist() {
   const sj = settingsJSON(state);
@@ -1416,6 +1422,7 @@ async function takeHome(p, { redo = false } = {}) {
     state.summaries[id] = { ts: Date.now(), model: orConf.model, source, cost: out.usage?.cost ?? null, data };
     ui.takehomeBusy.delete(id);
     persist();
+    saveSummary(id);
   } catch (err) {
     ui.takehomeBusy.set(id, `error: ${err.message}`);
   }
@@ -1478,6 +1485,7 @@ function renderSettings() {
         fit ? ` · ${fit.inTop20} of your ${fit.n} saves from the last month rank in For You's top 20` : ""}`
     : `needs ${MIN_POSITIVES - rk.positives} more ♥ / ☆ / opened papers before it starts adjusting (${rk.positives} so far)`}`;
   $("halflife").value = String(state.halfLife);
+  renderAccount();
   renderSync();
   renderTakehomeSettings();
 
@@ -1569,6 +1577,199 @@ $("reset").addEventListener("click", () => {
   persist(); affinityCache = nearCache = null; renderSettings(); render();
 });
 
+// ---- accounts (Supabase) ---------------------------------------------------------------
+// Signed in, your state syncs to your own row in Supabase (user_state) instead of a gist, take-homes
+// go to their own table, and your interests text (what the daily build has Claude score papers for)
+// lives on your profile. Row-level security means each person can only read and write their own
+// rows; the key below is the public one. Invite-only: sign-ups are off, so only people you invite
+// from the Supabase dashboard can sign in.
+
+const SUPABASE_URL = "https://uywohcjbluxrtqwphouk.supabase.co";
+const SUPABASE_KEY = "sb_publishable_hXcTWch1-JJciG-NeLVHEA__3DtAmXC";
+const SB = window.supabase?.createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "pkce" },
+});
+const redirectTo = () => location.origin + location.pathname;
+
+async function sbRead() {
+  const { data, error } = await SB.from("user_state").select("state, rev").eq("user_id", uid()).maybeSingle();
+  if (error) throw new Error(error.message);
+  return data || null;
+}
+
+// Postgres stores JSON with its keys reordered, so compare with keys sorted.
+const canon = (v) => JSON.stringify(v, (k, x) => (x && typeof x === "object" && !Array.isArray(x)
+  ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b))) : x));
+
+// Write only if nobody else wrote since we read (rev unchanged). False means: re-read, merge, retry.
+async function sbWrite(blob, rev, exists) {
+  if (!exists) {
+    const { error } = await SB.from("user_state").insert({ user_id: uid(), state: blob, rev: 1 });
+    if (error && error.code !== "23505") throw new Error(error.message);  // 23505: another device created it first
+    return !error;
+  }
+  const { data, error } = await SB.from("user_state")
+    .update({ state: blob, rev: rev + 1, updated_at: new Date().toISOString() })
+    .eq("user_id", uid()).eq("rev", rev).select("rev");
+  if (error) throw new Error(error.message);
+  return data.length === 1;
+}
+
+// One sync round with Supabase: read, merge into the state as it is now, write; retried on a conflict.
+async function syncAccount() {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const row = await sbRead();
+    const remote = row?.state || {};
+    const merged = mergeSynced(syncedPart(state), remote);
+    Object.assign(state, merged);
+    const blob = { ...merged };
+    delete blob.summaries;  // those live in their own table
+    const { summaries, ...remoteBlob } = remote;
+    if (row && canon(blob) === canon(remoteBlob)) return;  // nothing new to write
+    if (await sbWrite(blob, row?.rev || 0, !!row)) return;
+  }
+  throw new Error("couldn't save: another device kept writing at the same time");
+}
+
+async function loadAccountExtras() {
+  const [{ data: profile }, summaries] = await Promise.all([
+    SB.from("profiles").select("display_name, interests, onboarded").eq("user_id", uid()).maybeSingle(),
+    fetchAll(SB.from("summaries").select("paper_id, data, ts").eq("user_id", uid())),
+  ]);
+  account.profile = profile || { interests: "" };
+  for (const s of summaries) {
+    state.summaries[s.paper_id] = { ...(s.data || {}), ts: Date.parse(s.ts) || Date.now() };
+  }
+}
+
+// Supabase returns at most 1,000 rows per request: page through.
+async function fetchAll(query, page = 1000) {
+  const out = [];
+  for (let from = 0; ; from += page) {
+    const { data, error } = await query.range(from, from + page - 1);
+    if (error) throw new Error(error.message);
+    out.push(...data);
+    if (data.length < page) return out;
+  }
+}
+
+async function saveSummary(id) {
+  if (!uid() || !state.summaries[id]) return;
+  const { ts, ...data } = state.summaries[id];
+  const { error } = await SB.from("summaries").upsert({ user_id: uid(), paper_id: id, data, ts: new Date(ts).toISOString() });
+  if (error) console.warn("couldn't save take-home:", error.message);
+}
+
+async function saveInterests(text) {
+  const { error } = await SB.from("profiles").update({ interests: text, updated_at: new Date().toISOString() }).eq("user_id", uid());
+  if (error) throw new Error(error.message);
+  account.profile = { ...account.profile, interests: text };
+}
+
+// Switching who's signed in swaps the whole local state: each user has their own copy in this browser.
+async function onSignedIn(user) {
+  if (account.user?.id === user.id) return;
+  const loggedOut = syncedPart(state);
+  account.user = user;
+  const mine = (() => { try { return localStorage.getItem(storeKey()); } catch { return null; } })();
+  state = mine ? loadState() : { ...defaults(), lastVisit: Date.now() };
+  settingsSeen = settingsJSON(state);
+  affinityCache = nearCache = null;
+  try {
+    await loadAccountExtras();
+    await syncAccount();
+    // First sign-in on this browser: offer to bring in what was saved here while signed out.
+    const n = ["saved", "favorites", "hidden"].reduce((k, m) => k + Object.keys(loggedOut[m] || {}).length, 0);
+    if (!mine && n && confirm(`Add this browser's ${n} saved, favorited and hidden papers to your account?`)) {
+      Object.assign(state, mergeSynced(syncedPart(state), loggedOut));
+      await syncAccount();
+      for (const id of Object.keys(state.summaries)) saveSummary(id);
+    }
+    saveLocal();
+    syncedJSON = JSON.stringify(syncedPart(state));
+    Object.assign(syncStatus, { at: Date.now(), error: null });
+  } catch (err) {
+    account.error = err.message;
+  }
+  renderAccountButton();
+  if (DATA.generated) render({ keepPage: true });
+}
+
+function onSignedOut() {
+  account.user = null; account.profile = null;
+  state = loadState(); settingsSeen = settingsJSON(state); affinityCache = nearCache = null;
+  renderAccountButton();
+  if (DATA.generated) render({ keepPage: true });
+}
+
+function renderAccountButton() {
+  const b = $("account-btn");
+  if (!SB) { b.hidden = true; return; }
+  const name = account.profile?.display_name || account.user?.email || "";
+  b.textContent = account.user ? (name[0] || "?").toUpperCase() : "Sign in";
+  b.title = account.user ? `Signed in as ${name}` : "Sign in to sync and get your own AI scores";
+  b.classList.toggle("signed-in", !!account.user);
+}
+
+function renderAccount() {
+  if (!SB) { $("account-box").innerHTML = `<p class="hint">Accounts aren't available (couldn't load Supabase).</p>`; return; }
+  const err = account.error ? `<p class="hint sync-error">${esc(account.error)}</p>` : "";
+  if (!account.user) {
+    $("account-box").innerHTML = `
+      <p class="hint">Sign in to keep your saves, favorites and settings on every device, and (from the next
+        daily build) get Claude's scores written for your interests. Invite-only.</p>
+      <div class="btnrow"><button type="button" data-acct="github">Continue with GitHub</button></div>
+      <div class="btnrow"><input type="email" id="acct-email" placeholder="you@example.org" autocomplete="email" aria-label="Email">
+        <button type="button" data-acct="email">Email me a sign-in link</button></div>${err}`;
+    return;
+  }
+  $("account-box").innerHTML = `
+    <p class="hint">Signed in as <b>${esc(account.user.email || account.profile?.display_name || "")}</b>${
+      syncStatus.at ? ` · synced ${new Date(syncStatus.at).toLocaleTimeString([], { timeStyle: "short" })}` : ""}.</p>
+    <label class="hint" for="acct-interests">What should Claude look for? Plain prose, like a note to a colleague: your
+      fields, what makes a paper a must-read for you, what to skip.</label>
+    <textarea id="acct-interests" rows="7" placeholder="I work on…">${esc(account.profile?.interests || "")}</textarea>
+    <div class="btnrow"><button type="button" data-acct="save-interests">Save interests</button>
+      <button type="button" data-acct="signout">Sign out</button></div>${err}`;
+}
+
+$("account-box").addEventListener("click", async (e) => {
+  const act = e.target.closest("[data-acct]")?.dataset.acct;
+  if (!act) return;
+  account.error = null;
+  try {
+    if (act === "github") {
+      const { error } = await SB.auth.signInWithOAuth({ provider: "github", options: { redirectTo: redirectTo() } });
+      if (error) throw error;
+    }
+    if (act === "email") {
+      const email = $("acct-email").value.trim();
+      if (!email) return;
+      const { error } = await SB.auth.signInWithOtp({ email, options: { shouldCreateUser: false, emailRedirectTo: redirectTo() } });
+      if (error) throw error;
+      account.error = null;
+      $("account-box").insertAdjacentHTML("beforeend", `<p class="hint">Check ${esc(email)} for a sign-in link.</p>`);
+      return;
+    }
+    if (act === "save-interests") { await saveInterests($("acct-interests").value); e.target.textContent = "Saved ✓"; return; }
+    if (act === "signout") { await SB.auth.signOut(); }
+  } catch (err) {
+    account.error = /signups not allowed|not allowed/i.test(err.message) ? "That account isn't invited yet. Ask the site owner to invite you." : err.message;
+  }
+  renderAccount();
+});
+$("account-btn").addEventListener("click", () => { renderSettings(); $("settings").showModal(); $("account-box").scrollIntoView({ block: "start" }); });
+
+// A failed OAuth sign-in comes back with the error in the URL (e.g. someone who isn't invited).
+(function oauthError() {
+  const q = new URLSearchParams(location.hash.slice(1) || location.search);
+  const msg = q.get("error_description");
+  if (msg) {
+    account.error = /signups not allowed/i.test(msg) ? "That account isn't invited yet. Ask the site owner to invite you." : msg;
+    history.replaceState(null, "", location.pathname);
+  }
+})();
+
 // ---- sync (secret GitHub Gist) ---------------------------------------------------------
 // Votes / saves / hides merge per paper, newest wins. Un-doing one leaves a timestamped
 // tombstone in `removed` so other devices drop it too. Settings sync as one block, last
@@ -1637,16 +1838,26 @@ function saveSyncConfig() {
 }
 
 function scheduleSync() {
-  if (!sync.token || JSON.stringify(syncedPart(state)) === syncedJSON) return;
+  if ((!sync.token && !uid()) || JSON.stringify(syncedPart(state)) === syncedJSON) return;
   clearTimeout(syncTimer);
   syncTimer = setTimeout(syncNow, 2000);
 }
 
 async function syncNow() {
-  if (!sync.token) return;
+  if (!sync.token && !uid()) return;
   if (syncStatus.busy) { syncStatus.again = true; return; }
   syncStatus.busy = true; clearTimeout(syncTimer);
   try {
+    if (uid()) {
+      const before = JSON.stringify(syncedPart(state));
+      await syncAccount();
+      settingsSeen = settingsJSON(state);
+      saveLocal();
+      syncedJSON = JSON.stringify(syncedPart(state));
+      Object.assign(syncStatus, { at: Date.now(), error: null });
+      if (syncedJSON !== before) { affinityCache = nearCache = null; if (DATA.generated) render({ keepPage: true }); }
+      return;
+    }
     sync.gistId ||= await findGist();
     const remote = sync.gistId ? await readGist() : {};
     const before = JSON.stringify(syncedPart(state));
@@ -1674,12 +1885,16 @@ async function syncNow() {
   } finally {
     syncStatus.busy = false;
     if (syncStatus.again) { syncStatus.again = false; scheduleSync(); }
-    if ($("settings").open) renderSync();
+    if ($("settings").open) { renderSync(); renderAccount(); }
   }
 }
 
 function renderSync() {
   const err = syncStatus.error ? `<p class="hint sync-error">${esc(syncStatus.error)}</p>` : "";
+  if (uid()) {
+    $("sync-box").innerHTML = `<p class="hint">You're signed in, so everything syncs with your account.</p>${err}`;
+    return;
+  }
   if (!sync.token) {
     $("sync-box").innerHTML = `
       <p class="hint">Keep saves, upvotes, hides and ranking settings in a secret GitHub Gist so they follow
@@ -1715,9 +1930,18 @@ $("sync-box").addEventListener("click", async (e) => {
 
 // Pick up changes from other devices when you come back to the tab.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && sync.token && Date.now() - (syncStatus.at || 0) > 60000) syncNow();
+  if (!document.hidden && (sync.token || uid()) && Date.now() - (syncStatus.at || 0) > 60000) syncNow();
 });
-if (sync.token) syncNow();
+
+// Sign-in state: the session is restored from this browser (or completed from a sign-in link).
+if (SB) {
+  SB.auth.onAuthStateChange((event, session) => {
+    if (session?.user) setTimeout(() => onSignedIn(session.user), 0);  // not inside Supabase's callback
+    else if (event === "SIGNED_OUT") onSignedOut();
+  });
+}
+renderAccountButton();
+if (sync.token && !SB) syncNow();
 
 load().catch((err) => {
   $("sub").textContent = "couldn't load papers";

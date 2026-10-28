@@ -63,6 +63,10 @@ jobs:
             --days "${{ inputs.days || '3' }}" \
             --previous "$SITE_URL/data" \
             --site-url "$SITE_URL/"
+      - name: Make sure no secret key is published
+        run: |
+          # Only the public (publishable) Supabase key belongs in the site; the service key stays a secret.
+          if grep -rqE "sb_secret_|service_role" site/; then echo "::error::A secret Supabase key is in site/"; exit 1; fi
       - name: Push archive files
         env:
           GH_TOKEN: ${{ github.token }}

@@ -15,6 +15,7 @@
         <div class="sub" id="sub">loading…</div>
       </div>
       <div class="sections" id="sections" role="group" aria-label="Section"></div>
+      <button class="acctbtn" id="account-btn" type="button">Sign in</button>
       <button class="iconbtn" id="open-settings" aria-label="Settings" title="Ranking, tabs &amp; data">⚙︎</button>
     </header>
   </div>
@@ -66,6 +67,11 @@
         <h2>Settings</h2>
         <button class="iconbtn" value="close" aria-label="Close">✕</button>
       </div>
+
+      <section>
+        <h3>Account</h3>
+        <div id="account-box"></div>
+      </section>
 
       <section>
         <h3>“For You” ranking</h3>
@@ -122,6 +128,7 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" hidden></div>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
