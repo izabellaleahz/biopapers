@@ -211,6 +211,7 @@ topics:
     color: "#8fa8d6"
     keep: true
     arxiv: [cs.DM]
+    venues: [Journal of Graph Theory, JCT Series B, Random Structures & Algorithms, SIAM Journal on Discrete Mathematics]
     # Graph theory proper (math.CO / cs.DM, fetched keyword-gated, see sources.yaml) plus network
     # science and learning on graphs. Title words are plural / compound on purpose: "graph" alone
     # would also prefix-match "graphical", "graphics" and "graphene".

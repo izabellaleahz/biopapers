@@ -138,14 +138,15 @@ def regions(xy: np.ndarray, ids: list[str], unit: np.ndarray, papers: dict[str, 
     return labels, out
 
 
-def run(out_dir: Path, log, previous: dict | None = None, papers: dict[str, dict] | None = None, name=None) -> None:
+def run(out_dir: Path, log, previous: dict | None = None, papers: dict[str, dict] | None = None, name=None) -> dict | None:
     """`previous` is yesterday's map.json; `papers` maps id -> record (for region titles); `name` is
-    ai.complete_json, or None to leave regions unnamed."""
+    ai.complete_json, or None to leave regions unnamed. Returns {"region": {id: index}, "labels": [...]}
+    so the feed can carry each paper's region without loading the map."""
     previous, papers = previous or {}, papers or {}
     meta = json.loads((out_dir / "vectors.json").read_text())
     ids = meta["ids"]
     if len(ids) <= K + 1:
-        return
+        return None
     vecs = np.frombuffer((out_dir / "vectors.bin").read_bytes(), dtype=np.int8).reshape(-1, meta["dim"]).astype(np.float32)
     unit = vecs / np.linalg.norm(vecs, axis=1, keepdims=True).clip(1e-6)
     nn = neighbours(unit)
@@ -174,4 +175,5 @@ def run(out_dir: Path, log, previous: dict | None = None, papers: dict[str, dict
                "c": labels.astype(int).tolist(), "regions": regs}
     (out_dir / "map.json").write_text(json.dumps(payload, separators=(",", ":")))
     log(f"  map: {len(ids)} papers laid out ({'stable, from yesterday' if init is not None else 'fresh'})")
+    return {"region": dict(zip(ids, labels.astype(int).tolist())), "labels": [r["label"] for r in regs]}
 

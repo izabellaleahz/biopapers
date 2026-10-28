@@ -8,7 +8,7 @@
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks", "explored"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs", "learn"];
 const DAY = 86400000;
 const MUST_READ = 6; // AI score (0–10) at which a paper lands in "Must read"
@@ -38,6 +38,7 @@ const FEATURES = {
   recency: { label: "New", def: 1 },
   buzz: { label: "Buzz (HF upvotes · HN · Bluesky · press)", def: 0.6 },
   pi: { label: "From a watched PI", def: 1 },
+  journal: { label: "Peer-reviewed (in a journal)", def: 0.3 },
 };
 
 const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
@@ -45,7 +46,7 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, removed: {}, settingsAt: 0,
+  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, explored: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(FEATURES).map(([k, w]) => [k, w.def])), learn: true, clicks: {},
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
@@ -103,6 +104,7 @@ let favsLoaded = null; // favorites.json: favorites outside the window (on the g
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
 let ui = { shown: PAGE, query: "", newOnly: false, pi: null, forYou: null, // For You chip: null | "must" | "near" | "label:…"
+  source: null, // For You source chip: null | "journals" | "preprints"
   lastCount: 0,
   takehomeOpen: new Set(), takehomeBusy: new Map() }; // busy: id -> status text (or "error: …")
 
@@ -139,9 +141,20 @@ async function load() {
   render();
   if (state.section === "ml") await loadML();
   addPapers(await fetchPapers("older.json"));
+  pruneLogs();
   migrateVotes();
   render({ keepPage: true });
   loadVectors();
+}
+
+// Clicks and exploration records only matter for recent ranking: drop them after 90 days.
+function pruneLogs() {
+  const cut = Date.now() - 90 * DAY;
+  let changed = false;
+  for (const m of ["clicks", "explored"]) {
+    for (const [id, v] of Object.entries(state[m])) if (entryTs(v) < cut) { delete state[m][id]; changed = true; }
+  }
+  if (changed) persist();
 }
 
 async function loadVectors() {
@@ -273,6 +286,7 @@ function features(p, rk, now) {
     Math.pow(0.5, age / state.halfLife),   // recency
     Math.min(1, Math.log1p(p.buzz_score || 0) / Math.log1p(20)),  // buzz
     p.pis?.length ? 1 : 0,                 // pi
+    p.kind === "article" ? 1 : 0,          // journal (vs preprint)
   ];
 }
 
@@ -284,7 +298,8 @@ function trainingSet() {
   add(Object.keys(state.saved), 2);
   add(Object.keys(state.summaries), 2);
   add(Object.keys(state.clicks), 1);
-  const neg = new Map(Object.keys(state.hidden).filter((id) => byId.has(id) && !pos.has(id)).map((id) => [id, 2]));
+  const neg = new Map(Object.keys(state.hidden)
+    .filter((id) => byId.has(id) && !pos.has(id) && hideReason(id) !== "read").map((id) => [id, 2]));
   const unlabeled = DATA.papers.filter((p) => !pos.has(p.id) && !neg.has(p.id) && !has(state.hidden, p))
     .sort((a, b) => hash32(a.id) - hash32(b.id)).slice(0, Math.max(60, 3 * pos.size));
   for (const p of unlabeled) neg.set(p.id, 0.5);
@@ -323,59 +338,133 @@ function ranker() {
   if (VEC) {
     REF.fav.sync(Object.keys(state.favorites));
     REF.saved.sync(recentIds(state.saved));
-    REF.hidden.sync(recentIds(state.hidden));
+    // Only a plain ✕ makes similar papers look worse: "not my area" works through the region instead,
+    // and "already read" / "low quality" say nothing about the topic.
+    REF.hidden.sync(recentIds(Object.fromEntries(Object.entries(state.hidden).filter(([id]) => !hideReason(id)))));
   }
-  const rk = { scale: VEC ? { fav: REF.fav.scale(), saved: REF.saved.scale(), hidden: REF.hidden.scale() } : {} };
+  const rk = { scale: VEC ? { fav: REF.fav.scale(), saved: REF.saved.scale(), hidden: REF.hidden.scale() } : {},
+               regionDown: regionDownweights() };
   affinityCache = Object.assign(rk, fitModel(rk));
   return affinityCache;
 }
 
 const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
-const rankScore = (p, rk, now) => topicWeight(p) * dot(rk.w, features(p, rk, now));
+const rankScore = (p, rk, now) => topicWeight(p) * (rk.regionDown.get(p.region) ?? 1) * dot(rk.w, features(p, rk, now));
 
-// Re-rank the top of the list: spread out near-duplicates, and give every 7th slot (from the 5th) to a
-// strong paper (AI ≥ 6) unlike anything you've favorited or saved, so the feed doesn't narrow over time.
-const HEAD = 80, DUP_SIM = 0.8;
-let exploring = new Set();
+const hideReason = (id) => state.hidden[id]?.reason || null;
+// "Not my area" turns a whole map region down: x0.75 per such hide, to a floor of 0.4. It's counted
+// from the hides themselves, so it keeps working after those papers leave the 30-day window.
+function regionDownweights() {
+  const n = new Map();
+  for (const h of Object.values(state.hidden)) if (h?.reason === "area" && h.r != null) n.set(h.r, (n.get(h.r) || 0) + 1);
+  return new Map([...n].map(([r, k]) => [r, Math.max(0.4, 0.75 ** k)]));
+}
+
+// Re-rank the top of the list, in three steps:
+// 1. Dither: each paper's rank gets a small random nudge on a log scale (seeded by day and paper),
+//    so the top barely moves, the tail reshuffles, and the order is stable within a day.
+// 2. Spread: near-duplicates are pushed apart, and no map region takes more than REGION_CAP of the
+//    top 20.
+// 3. Explore: every 7th slot from the 5th (~15%) goes to a good paper from a region picked by a
+//    per-region bandit, so regions you've never been shown still come up. Each region keeps a
+//    Beta(1 + engaged, 1 + 0.2·shown + hidden) estimate from papers it explored for you.
+const HEAD = 80, DUP_SIM = 0.8, REGION_CAP = 4, DITHER = Math.log(1.3);
+let exploring = new Map(); // paper id -> region it was explored from
+
+// Seeded randomness: the same day, user and paper always give the same draw.
+const unit = (key) => (hash32(key) + 0.5) / 4294967296;
+const gauss = (key) => Math.sqrt(-2 * Math.log(unit(key))) * Math.cos(2 * Math.PI * unit(key + "#"));
+function gammaSample(a, key) {  // Marsaglia–Tsang, for a >= 1
+  const d = a - 1 / 3, c = 1 / Math.sqrt(9 * d);
+  for (let i = 0; i < 20; i++) {
+    const x = gauss(`${key}:x${i}`), v = (1 + c * x) ** 3;
+    if (v > 0 && Math.log(unit(`${key}:u${i}`)) < 0.5 * x * x + d - d * v + d * Math.log(v)) return d * v;
+  }
+  return d;
+}
+const betaSample = (a, b, key) => { const x = gammaSample(a, key + "a"); return x / (x + gammaSample(b, key + "b")); };
+const today = () => new Date().toISOString().slice(0, 10);
+const userKey = () => "local"; // per-user once accounts exist
+
+function regionBandit(seed) {
+  const stats = new Map(), bump = (r, k, by = 1) => {
+    const s = stats.get(r) || { engaged: 0, shown: 0, hidden: 0 }; s[k] += by; stats.set(r, s);
+  };
+  const positive = (id) => state.favorites[id] || state.saved[id] || state.summaries[id] || state.clicks[id];
+  for (const [id, e] of Object.entries(state.explored)) {
+    bump(e.r, "shown");
+    if (positive(id)) bump(e.r, "engaged");
+    else if (state.hidden[id] && hideReason(id) !== "read") bump(e.r, "hidden");
+  }
+  return (r, slot) => { const s = stats.get(r) || { engaged: 0, shown: 0, hidden: 0 };
+    return betaSample(1 + s.engaged, 1 + 0.2 * s.shown + s.hidden, `${seed}:slot${slot}:region${r}`); };
+}
+
 function diversify(scored, rk) {
-  exploring = new Set();
+  exploring = new Map();
+  const seed = `${userKey()}:${today()}`;
+  scored = scored.map(([, p], i) => [-(Math.log(i + 1) - DITHER * gauss(`${seed}:${p.id}`)), p])
+    .sort((a, b) => b[0] - a[0]);
   if (!VEC) return scored.map(([, p]) => p);
   const head = scored.slice(0, HEAD), rest = scored.slice(HEAD);
-  const span = (head[0]?.[0] ?? 0) - (head[head.length - 1]?.[0] ?? 0) || 1, now = Date.now();
+  const span = (head[0]?.[0] ?? 0) - (head[head.length - 1]?.[0] ?? 0) || 1;
   const rowOf = new Map(head.map(([, p]) => [p.id, vecRow(p)]));
   const cos = (a, b) => {
-    const ra = rowOf.get(a.id), rb = rowOf.get(b.id);
+    const ra = rowOf.get(a.id) ?? vecRow(a), rb = rowOf.get(b.id) ?? vecRow(b);
     if (ra === undefined || rb === undefined) return 0;
     const { dim, data, norms } = VEC; let d = 0;
     for (let j = 0; j < dim; j++) d += data[ra * dim + j] * data[rb * dim + j];
     return d / (norms[ra] * norms[rb]);
   };
-  const outside = scored.filter(([, p]) => (p.ai?.score ?? 0) >= 6
-    && (([, fav, saved]) => fav < 0.3 && saved < 0.3)(features(p, rk, now)));
-  const picked = [], left = [...head], used = new Set();
+  // Exploration candidates: the best-ranked decent paper of each region. Decent means Claude rated it
+  // 5+ (when scored), or it's a journal paper or has buzz (when not).
+  const decent = (p) => typeof p.ai?.score === "number" ? p.ai.score >= 5 : (p.kind === "article" || p.buzz_score > 0);
+  const byRegion = new Map();
+  for (const [, p] of scored) if (p.region != null && decent(p) && !byRegion.has(p.region)) byRegion.set(p.region, []);
+  for (const [, p] of scored) if (p.region != null && decent(p) && byRegion.get(p.region).length < 5) byRegion.get(p.region).push(p);
+  const sample = regionBandit(seed);
+  const regionCount = new Map(), picked = [], left = [...head], used = new Set();
+  const take = (p) => { picked.push(p); used.add(p.id); regionCount.set(p.region, (regionCount.get(p.region) || 0) + 1); };
   while (left.length) {
-    if (picked.length >= 4 && (picked.length - 4) % 7 === 0) {
-      const ex = outside.find(([, p]) => !used.has(p.id));
-      if (ex) { picked.push(ex[1]); used.add(ex[1].id); exploring.add(ex[1].id); continue; }
+    if (picked.length >= 4 && (picked.length - 4) % 7 === 0 && byRegion.size) {
+      const choices = [...byRegion.entries()].map(([r, ps]) => [r, ps.find((p) => !used.has(p.id))]).filter(([, p]) => p);
+      const [r, ex] = choices.map(([r, p]) => [r, p, sample(r, picked.length)]).sort((a, b) => b[2] - a[2])[0] || [];
+      if (ex) { take(ex); exploring.set(ex.id, r); continue; }
     }
+    const inTop20 = picked.length < 20;
     let best = -1, bestV = -Infinity;
     for (let i = 0; i < left.length; i++) {
       const [s, p] = left[i];
       if (used.has(p.id)) continue;
+      if (inTop20 && p.region != null && (regionCount.get(p.region) || 0) >= REGION_CAP) continue;
       const near = picked.slice(-12).reduce((m, q) => Math.max(m, cos(p, q)), 0);  // the recent few is enough
       const v = s - (near > DUP_SIM ? span * 0.5 * (near - DUP_SIM) / (1 - DUP_SIM) : 0);
       if (v > bestV) { bestV = v; best = i; }
     }
-    if (best < 0) break;
-    const [, p] = left.splice(best, 1)[0];
-    picked.push(p); used.add(p.id);
+    if (best < 0) {  // only capped regions left: relax the cap
+      const i = left.findIndex(([, p]) => !used.has(p.id));
+      if (i < 0) break;
+      take(left.splice(i, 1)[0][1]);
+      continue;
+    }
+    take(left.splice(best, 1)[0][1]);
   }
+  logExplored(picked.slice(0, 40));
   return [...picked, ...rest.map(([, p]) => p).filter((p) => !used.has(p.id))];
+}
+
+// Remember which explored papers you were actually shown, for the bandit (kept 90 days).
+function logExplored(top) {
+  let added = false;
+  for (const p of top) {
+    if (exploring.has(p.id) && !state.explored[p.id]) { state.explored[p.id] = { ts: Date.now(), r: p.region }; added = true; }
+  }
+  if (added) setTimeout(persist, 0);  // not mid-render
 }
 
 // "Why it's here", from the two features that contribute most to this paper's score.
 function whyLine(p) {
-  if (exploring.has(p.id)) return `🧭 outside your usual areas · AI ${p.ai?.score}`;
+  if (exploring.has(p.id)) return `🧭 exploring ${DATA.regions?.[exploring.get(p.id)] || "something new"}${typeof p.ai?.score === "number" ? ` · AI ${p.ai.score}` : ""}`;
   const rk = affinityCache;
   if (!rk) return "";
   const x = features(p, rk, Date.now()), r = VEC ? vecRow(p) : undefined;
@@ -387,6 +476,7 @@ function whyLine(p) {
     4: () => { const d = Math.round(Math.max(0, (Date.now() - Date.parse(p.date)) / DAY)); return d < 1 ? "today" : `${d}d old`; },
     5: () => "buzzing",
     6: () => `PI · ${p.pis[0]}`,
+    7: () => `in ${p.venue}`,
   };
   return x.map((v, j) => [rk.w[j] * v, j]).filter(([c, j]) => c > 0.15 && say[j])
     .sort((a, b) => b[0] - a[0]).slice(0, 2).map(([, j]) => say[j]()).filter(Boolean).join(" · ");
@@ -473,6 +563,9 @@ function forYouChip(chip) {
   return (p) => state.favorites[near.get(p.id)?.fav]?.label === label;
 }
 
+// For You's source chips: peer-reviewed journal papers, or preprints (bioRxiv, medRxiv, arXiv).
+const sourceChip = (chip) => (p) => (p.kind === "article") === (chip === "journals");
+
 function savedPapers() {
   return Object.entries(state.saved)
     .sort((a, b) => b[1].ts - a[1].ts)
@@ -487,6 +580,7 @@ function visiblePapers() {
   let list = tab === "saved" ? savedPapers() : DATA.papers.filter((p) => inTab(p, tab) && !has(state.hidden, p));
   if (tab === "pis" && ui.pi) list = list.filter((p) => p.pis.includes(ui.pi));
   if ((tab === "foryou" || tab === "mlforyou") && ui.forYou) list = list.filter(forYouChip(ui.forYou));
+  if ((tab === "foryou" || tab === "mlforyou") && ui.source) list = list.filter(sourceChip(ui.source));
   if (ui.newOnly) list = list.filter(isNew);
   if (ui.query) {
     const q = ui.query.toLowerCase();
@@ -558,8 +652,12 @@ function render({ keepPage = false } = {}) {
         const chips = [[null, "All"], ["must", "Must read"],
           ...(Object.keys(state.favorites).length ? [["near", "♥ Near favorites"]] : []),
           ...labels.map((l) => [`label:${l}`, `♥ ${l}`])];
+        const sources = [[null, "All sources"], ["journals", "Journals"], ["preprints", "Preprints"]];
         return chips.map(([k, label]) => `<button class="chip ${ui.forYou === k ? "active" : ""}" data-foryou="${esc(k ?? "")}">${esc(label)}${
-          k ? ` <span class="n">${base.filter(forYouChip(k)).length}</span>` : ""}</button>`).join("");
+          k ? ` <span class="n">${base.filter(forYouChip(k)).length}</span>` : ""}</button>`).join("")
+          + `<span class="chip-sep" aria-hidden="true"></span>`
+          + sources.map(([k, label]) => `<button class="chip ${ui.source === k ? "active" : ""}" data-source="${k ?? ""}">${label}${
+            k ? ` <span class="n">${base.filter(sourceChip(k)).length}</span>` : ""}</button>`).join("");
       })()
     : "";
 
@@ -638,6 +736,33 @@ function card(p) {
   </article>`;
 }
 
+// ---- ✕ toast: why not? ---------------------------------------------------------------
+// ✕ hides a paper. The toast that follows lets you say why, which changes what it teaches the ranking:
+//   not my area   a "no", and the paper's whole map region turns down (see regionDownweights)
+//   already read  just hide it; nothing is learned
+//   low quality   a "no" for training, without making similar papers look worse
+//   (no answer)   a "no", and similar papers rank a bit lower
+let toastTimer = null;
+function showHideToast(p) {
+  const t = $("toast"), region = DATA.regions?.[p.region];
+  t.innerHTML = `<span>Hidden. Why?</span>
+    <button type="button" data-why="area" title="${region ? `Show less of ${esc(region)}` : "Show less like this"}">Not my area</button>
+    <button type="button" data-why="read">Already read</button>
+    <button type="button" data-why="quality">Low quality</button>
+    <button type="button" data-why="undo" class="undo">Undo</button>`;
+  t.dataset.id = p.id; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 9000);
+}
+$("toast").addEventListener("click", (e) => {
+  const why = e.target.closest("[data-why]")?.dataset.why, id = $("toast").dataset.id;
+  if (!why || !id) return;
+  if (why === "undo") forget("hidden", [id]);
+  else if (state.hidden[id]) state.hidden[id] = { ...(typeof state.hidden[id] === "object" ? state.hidden[id] : {}), ts: Date.now(), reason: why };
+  $("toast").hidden = true;
+  affinityCache = nearCache = null; persist(); render({ keepPage: true });
+});
+
+
 // ---- actions ---------------------------------------------------------------
 
 function toggle(name, p, value) {
@@ -679,7 +804,7 @@ $("feed").addEventListener("click", (e) => {
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
   if (act === "hide") {
     if (curTab() === "saved") toggle("saved", p);
-    else state.hidden[p.id] = Date.now();
+    else { state.hidden[p.id] = { ts: Date.now(), ...(p.region != null ? { r: p.region } : {}) }; showHideToast(p); }
   }
   affinityCache = nearCache = null; // hides count too: "not interested" pushes similar papers down
   persist();
@@ -715,6 +840,8 @@ $("chips").addEventListener("click", (e) => {
   if (c) { ui.pi = c.dataset.pi || null; render(); }
   const f = e.target.closest("[data-foryou]");
   if (f) { ui.forYou = f.dataset.foryou || null; render(); }
+  const src = e.target.closest("[data-source]");
+  if (src) { ui.source = src.dataset.source || null; render(); }
 });
 $("more").addEventListener("click", () => { ui.shown += PAGE; render({ keepPage: true }); });
 $("new-only").addEventListener("change", (e) => { ui.newOnly = e.target.checked; render(); });

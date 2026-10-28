@@ -1,12 +1,25 @@
 """Journals: RSS/Atom feeds, plus OpenAlex-by-ISSN for journals without usable feeds."""
 
 import datetime as dt
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import feedparser
 
 from ..common import client, find_doi, make_paper, parse_date
 from . import openalex
+
+
+# Journal feeds mix news, comment and corrections in with research. Nature's news and comment all have
+# DOIs 10.1038/d41586-…; the rest is caught by title (Europe PMC's publication types catch more later).
+NOT_RESEARCH_DOI = re.compile(r"^10\.1038/(d41586-|\d{3}\d+[a-z]$)")
+NOT_RESEARCH_TITLE = re.compile(
+    r"^(author correction|publisher correction|correction|erratum|retraction|editorial|"
+    r"daily briefing|career|news)\b|\(\d{4}[–-]\d{4}\)$", re.IGNORECASE)
+
+
+def is_research(p: dict) -> bool:
+    return not (NOT_RESEARCH_DOI.match(p.get("doi") or "") or NOT_RESEARCH_TITLE.search(p["title"].strip()))
 
 
 def _entry_date(e) -> str | None:

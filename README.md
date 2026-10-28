@@ -62,8 +62,12 @@ It's ranked by a small model of what you like: per paper, Claude's score, simila
 ♥ favorite / saved paper / hidden paper (nearest, so separate interests don't blur), recency, buzz and
 watched PIs, combined with weights fitted in the browser to what you do (♥ ☆, take-homes and opening
 papers vs ✕ and papers you pass over), starting from — and regularised toward — the sliders in ⚙︎.
-The top is de-duplicated, every 7th slot goes to a strong paper outside your usual areas, and each
-card says why it's there. In the site itself (⚙︎): the starting weights (with the learned values), recency half-life, tab order/visibility, per-topic weights,
+The order gets a small daily shuffle (stable within a day), no graph region takes more than 4 of
+the top 20, and every 7th slot explores a region picked by a per-region bandit (🧭). Each card says
+why it's there. ✕ asks why: *not my area* turns that whole region down (×0.75 each, floor 0.4, and it
+outlives the 30-day window), *already read* just hides, *low quality* counts as a "no" without
+penalising the topic, and no answer makes similar papers rank lower. Chips filter For You to
+journals or preprints. In the site itself (⚙︎): the starting weights (with the learned values), recency half-life, tab order/visibility, per-topic weights,
 export/import of your data, saved → BibTeX.
 
 ## AI scores, embeddings and the map
@@ -143,6 +147,11 @@ committing data. Optional repo secrets/variables:
 - **Keyword tagging** is rule-based; tune `config/topics.yaml` when a tab is too loose or too strict.
   Journal papers no rule tags aren't simply dropped: they stay if their AI score is ≥ 3 (For You shows
   them from 4), and get a topic tab when most of their nearest tagged papers share one.
+- **Journal abstracts:** news, comment and corrections are dropped (Nature's `d41586` DOIs, PubMed
+  types). Papers that arrive with a teaser get their full abstract from Europe PMC (PubMed), retried
+  daily for two weeks, then re-embedded and re-scored.
+- **ML / CS journals:** JASA, Annals of Statistics, Biometrika, JRSS-B, Nature Machine Intelligence,
+  Nature Computational Science, TPAMI and four graph-theory journals feed the ML section via OpenAlex.
 - **Journal coverage:** RSS feeds only list a journal's newest items (8 for every Nature journal), so
   busy journals are also pulled from OpenAlex by ISSN (complete, ~1–3 days late). Cell Press stays
   RSS-only: OpenAlex lists it under issue dates, weeks late.

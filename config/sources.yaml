@@ -104,6 +104,21 @@ ml:
   # Also fetched, but only papers matching an ML tab's keywords are kept: graph theory lives in
   # combinatorics / discrete math, causal inference in statistical methodology and econometrics.
   arxiv_keyword_only: [math.CO, cs.DM, cs.SI, stat.ME, econ.EM]
+  # Peer-reviewed ML / statistics / graph-theory journals, from OpenAlex by ISSN. Everything from
+  # these lands in the ML / CS section (their papers can also be in Bio when a bio topic matches).
+  # JMLR, TMLR, Combinatorica and J. Causal Inference aren't indexed by OpenAlex recently.
+  journals:
+    Nature Machine Intelligence: 2522-5839
+    Nature Computational Science: 2662-8457
+    IEEE TPAMI: 0162-8828
+    JASA: 0162-1459
+    Annals of Statistics: 0090-5364
+    Biometrika: 0006-3444
+    JRSS-B: 1369-7412
+    Journal of Graph Theory: 0364-9024
+    JCT Series B: 0095-8956
+    Random Structures & Algorithms: 1042-9832
+    SIAM Journal on Discrete Mathematics: 0895-4801
   huggingface: true     # HF Daily Papers — curated, with upvotes, AI TL;DRs, GitHub links
   huggingface_days: 30
 

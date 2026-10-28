@@ -29,7 +29,7 @@ from xml.sax.saxutils import escape
 
 from .common import ROOT, client, load_config, read_gist_state, strip_label, title_key, today
 from . import ai, archive, embed, favorites, layout, tagging
-from .sources import buzz, huggingface, journals, openalex, preprints
+from .sources import buzz, europepmc, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
 OUT_DIR = ROOT / "site" / "data"
@@ -44,6 +44,8 @@ MAX_ABSTRACT = 1500
 MAX_ABSTRACT_ML = 900
 PI_KEEP_DAYS = 180  # watched-PI papers stick around longer than the general feed
 OPENALEX_LOOKBACK = 10  # days; OpenAlex lists journal papers 1-3 days after they're out
+EPMC_DAYS = 14   # keep asking Europe PMC for a real abstract this long (PubMed indexes days late)
+EPMC_MIN = 400   # abstracts shorter than this are teasers worth replacing
 KEEP_UNTAGGED_SCORE = 3  # a journal paper no rule tagged stays if its AI score is at least this
 
 
@@ -105,6 +107,8 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger) 
     ml = sources.get("ml", {})
     if "ml" in only and ml.get("arxiv"):
         papers += timed("ml arxiv", preprints.fetch_arxiv, ml["arxiv"], min(days, ml.get("firehose_days", 3)))
+    if "ml" in only and ml.get("journals"):
+        papers += journals.fetch_issn_journals(ml["journals"], max(days, OPENALEX_LOOKBACK), log)
     if "ml" in only and ml.get("arxiv_keyword_only"):
         got = timed("ml arxiv (keyword-gated)", preprints.fetch_arxiv, ml["arxiv_keyword_only"], days)
         papers += [p for p in got if tagger.keyword_topics_for(p, "ml")]
@@ -185,6 +189,37 @@ def enrich(papers: dict[str, dict], signals: dict[str, dict]) -> None:
         f"{sum(d in found for d in missing)}/{len(missing)} buzzing papers added")
 
 
+def enrich_abstracts(papers: dict[str, dict]) -> set[str]:
+    """Full abstracts from Europe PMC (PubMed) for journal papers that came with a teaser or nothing,
+    retried daily for two weeks (PubMed indexes a few days late). Also flags non-research items by
+    their PubMed type. Returns the ids whose text changed, to re-embed and re-score."""
+    cut = (today() - dt.timedelta(days=EPMC_DAYS)).isoformat()
+    todo = [p for p in papers.values()
+            if p.get("kind") == "article" and p.get("doi") and len(p.get("abstract") or "") < EPMC_MIN
+            and p.get("added", "9999") >= cut and p.get("epmc") != today().isoformat()]
+    if not todo:
+        return set()
+    try:
+        found = europepmc.lookup_dois([p["doi"] for p in todo])
+    except Exception as ex:
+        log(f"  europe pmc: FAILED ({ex.__class__.__name__}: {ex})")
+        return set()
+    changed = set()
+    for p in todo:
+        p["epmc"] = today().isoformat()
+        if not (e := found.get(p["doi"])):
+            continue
+        if not e["research"]:
+            p["not_research"] = True
+        if len(e["abstract"]) > len(p.get("abstract") or ""):
+            p["abstract"] = e["abstract"]
+            p.pop("ai", None)  # scored on a teaser: score again with the real abstract
+            changed.add(p["id"])
+    log(f"  europe pmc: {len(changed)} of {len(todo)} short journal abstracts filled, "
+        f"{sum(bool(p.get('not_research')) for p in todo)} non-research items flagged")
+    return changed
+
+
 def apply_buzz(papers: dict[str, dict], signals: dict[str, dict]) -> None:
     for doi, sig in signals.items():
         if p := papers.get(doi):
@@ -216,12 +251,12 @@ def dedup_versions(papers: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
-def sections_for(p: dict, tagger: Tagger, ml_cats: tuple) -> list[str]:
+def sections_for(p: dict, tagger: Tagger, ml_cats: tuple, ml_venues: frozenset = frozenset()) -> list[str]:
     """Which top-level sections (Bio / ML) a paper shows up in."""
     secs = {tagger.section_of[t] for t in p["topics"]}
     if p["pis"]:
         secs.add("bio")
-    if p.get("hf") or any(c.startswith(ml_cats) for c in p.get("arxiv_cats", [])):
+    if p.get("hf") or any(c.startswith(ml_cats) for c in p.get("arxiv_cats", [])) or p["venue"] in ml_venues:
         secs.add("ml")
     if not secs and p.get("buzz_score", 0) > 0:  # off-topic but buzzing
         secs.add("ml" if p["venue"] == "arXiv" else "bio")
@@ -247,12 +282,15 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
     pi_cutoff = (today() - dt.timedelta(days=PI_KEEP_DAYS)).isoformat()
     firehose_cutoff = (today() - dt.timedelta(days=ml_cfg.get("firehose_days", 3))).isoformat()
     ml_cats = tuple(ml_cfg.get("arxiv", [])) or ("\0",)
+    ml_venues = frozenset(ml_cfg.get("journals", {}))
     kept, untagged = [], []
     for p in papers.values():
+        if p["kind"] == "article" and (p.get("not_research") or not journals.is_research(p)):
+            continue  # news, comment, corrections (the archive still has them)
         p["topics"] = tagger.topics_for(p)
         p["pis"] = tagger.pis_for(p)
         p.setdefault("added", today().isoformat())
-        p["sections"] = sections_for(p, tagger, ml_cats)
+        p["sections"] = sections_for(p, tagger, ml_cats, ml_venues)
         if not p["sections"]:
             if p["kind"] == "article" and p["date"] >= cutoff:
                 untagged.append(p)
@@ -263,8 +301,8 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
             continue
         # The ML firehose is huge: past a few days, keep only papers someone is paying attention to
         # (or that sit in a niche tab marked `keep`).
-        if (p["sections"] == ["ml"] and not p.get("buzz_score") and p["date"] < firehose_cutoff
-                and not tagger.keep_topics.intersection(p["topics"])):
+        if (p["sections"] == ["ml"] and p["venue"] == "arXiv" and not p.get("buzz_score")
+                and p["date"] < firehose_cutoff and not tagger.keep_topics.intersection(p["topics"])):
             continue
         kept.append(trim(p, tagger))
     kept.sort(key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)
@@ -311,6 +349,11 @@ def main() -> None:
     topics_cfg = topics_file["topics"]
     people_cfg = load_config("people").get("people", [])
     sections_cfg = topics_file.get("sections", {"bio": {"label": "Bio"}})
+    if ml_journals := list(load_config("sources").get("ml", {}).get("journals", {})):
+        # ML tabs only match arXiv papers (so a bioRxiv paper mentioning "protein" stays out of AI for
+        # Science); the configured ML journals count as ML venues too.
+        ml_sec = sections_cfg.setdefault("ml", {"label": "ML / CS"})
+        ml_sec["only_venues"] = [*ml_sec.get("only_venues", []), *ml_journals]
     tagger = Tagger(topics_cfg, people_cfg, sections_cfg)
 
     previous = load_previous(args.previous)
@@ -321,6 +364,7 @@ def main() -> None:
     fresh, signals = fetch_everything(days, args.keep_days, only, tagger)
     papers = merge(previous, fresh)
     enrich(papers, signals)
+    refreshed = enrich_abstracts(papers) if "openalex" in only or "rss" in only else set()
     apply_buzz(papers, signals)
     papers = dedup_versions(papers)
     final, untagged = finalize(papers, tagger, args.keep_days, load_config("sources").get("ml", {}))
@@ -354,7 +398,8 @@ def main() -> None:
 
     vecs, similar = {}, set()
     if "embed" in only:
-        vecs = embed.vectors(final + untagged + extras, embed.load_previous(args.previous), log)
+        previous_vecs = {k: v for k, v in embed.load_previous(args.previous).items() if k not in refreshed}
+        vecs = embed.vectors(final + untagged + extras, previous_vecs, log)
         similar = {p["id"] for p in tagging.by_similarity(untagged, final, vecs, tagger.section_of)}
     relevant = lambda p: (s := (p.get("ai") or {}).get("score")) is not None and s >= KEEP_UNTAGGED_SCORE
     kept = [p for p in untagged if p["id"] in similar or relevant(p)]
@@ -369,10 +414,14 @@ def main() -> None:
     final = sorted(final + [trim(p, tagger) for p in kept], key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)
     extras = [e for e in extras if e["id"] not in kept_ids]
 
+    regions = None
     if "embed" in only:
         embed.write(final + extras, vecs, OUT_DIR)
-        layout.run(OUT_DIR, log, previous=fetch_json(args.previous, "map.json"),
-                   papers={p["id"]: p for p in final + extras}, name=ai.complete_json if "ai" in only else None)
+        regions = layout.run(OUT_DIR, log, previous=fetch_json(args.previous, "map.json"),
+                             papers={p["id"]: p for p in final + extras}, name=ai.complete_json if "ai" in only else None)
+        for p in final:  # each paper carries its map region (for ✕ "not my area" and exploration)
+            if regions and (r := regions["region"].get(p["id"])) is not None:
+                p["region"] = r
     (OUT_DIR / "favorites.json").write_text(json.dumps({"papers": extras}, ensure_ascii=False, separators=(",", ":")))
     recent_cut = (today() - dt.timedelta(days=RECENT_DAYS)).isoformat()
     bio = [p for p in final if "bio" in p["sections"]]
@@ -383,6 +432,7 @@ def main() -> None:
         "topics": [{"slug": t["slug"], "label": t["label"], "color": t["color"],
                     "section": t.get("section", "bio")} for t in topics_cfg],
         "people": [{"name": p["name"], "note": p.get("note", "")} for p in people_cfg],
+        "regions": regions["labels"] if regions else (fetch_json(args.previous, "papers.json") or {}).get("regions", []),
         "papers": recent,
     }
     out = OUT_DIR / "papers.json"
