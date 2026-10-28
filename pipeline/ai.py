@@ -1,8 +1,10 @@
 """AI relevance scores + TL;DRs from Claude Haiku 5.5.
 
-Each unscored paper gets p["ai"] = {"score": 0-10, "tldr": "...", "why": "..."}, written for the
+Each unscored paper gets p["ai"] = {"score": 0-10, "tldr": "...", "why": "...", "topics": [...]}, written for the
 reader described in config/profile.md (plus their favorites and the papers they saved /
 upvoted, if Gist sync is on and BIOPAPERS_GIST_ID is set). Papers go out PER_REQUEST to a request.
+"topics" are the Bio tabs the model would file the paper under: the build uses them for journal papers
+no keyword rule tagged (broad journals like Nature and Science have no subject categories).
 
 Two ways to reach the model, picked by which key is set:
   ANTHROPIC_API_KEY   the Message Batches API (half price). A build waits up to `wait_min` minutes
@@ -13,6 +15,7 @@ Two ways to reach the model, picked by which key is set:
 With neither, the step is skipped.
 """
 
+import functools
 import hashlib
 import json
 import os
@@ -21,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
-from .common import CONFIG_DIR
+from .common import CONFIG_DIR, load_config
 
 MODEL = "claude-haiku-5-5"
 OPENROUTER_MODEL = "anthropic/claude-haiku-5.5"
@@ -37,20 +40,39 @@ INSTRUCTIONS = """You triage new research papers for one reader, described below
 - score: an integer 0-10 for how much THIS reader would want to read it. Be stingy. Most papers are 0-3; a solid paper in one of their areas is 4-6; 7-8 means they'd be sorry to miss it; 9-10 is rare (a few a week) and reserved for field-changing work squarely in their interests. Relevance to this reader matters as much as quality.
 - tldr: one plain sentence (at most 30 words) stating the main finding or contribution concretely: what was shown or built, not "this paper studies". No hype.
 - why: a few words on why it matters to this reader, or "outside your areas".
+- topics: which of the reader's tabs (listed below) the paper belongs in, by slug, judged on what the paper is about, not on how much the reader would like it. Only tabs it squarely belongs in: a neuroscience paper that mentions microglia isn't Immunology. Most papers outside these areas get none.
 Return every paper exactly once, with its number as n."""
 
-SCHEMA = {
-    "type": "object",
-    "properties": {"papers": {"type": "array", "items": {
+
+@functools.cache
+def bio_topics() -> tuple[tuple[str, str], ...]:
+    """(slug, description) for each Bio tab in config/topics.yaml — the choices for "topics"."""
+    out = []
+    for t in load_config("topics")["topics"]:
+        if t.get("section", "bio") == "bio":
+            cats = ", ".join(t.get("categories", []))
+            out.append((t["slug"], f"{t['label']} ({cats})" if cats else t["label"]))
+    return tuple(out)
+
+
+def instructions() -> str:
+    return INSTRUCTIONS + "\n\n<tabs>\n" + "\n".join(f"- {s}: {d}" for s, d in bio_topics()) + "\n</tabs>"
+
+
+def schema() -> dict:
+    return {
         "type": "object",
-        "properties": {"n": {"type": "integer"}, "score": {"type": "integer"},
-                       "tldr": {"type": "string"}, "why": {"type": "string"}},
-        "required": ["n", "score", "tldr", "why"],
+        "properties": {"papers": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}, "score": {"type": "integer"},
+                           "tldr": {"type": "string"}, "why": {"type": "string"},
+                           "topics": {"type": "array", "items": {"type": "string", "enum": [s for s, _ in bio_topics()]}}},
+            "required": ["n", "score", "tldr", "why", "topics"],
+            "additionalProperties": False,
+        }}},
+        "required": ["papers"],
         "additionalProperties": False,
-    }}},
-    "required": ["papers"],
-    "additionalProperties": False,
-}
+    }
 
 
 def load_profile() -> str:
@@ -59,9 +81,9 @@ def load_profile() -> str:
 
 
 def profile_version() -> str:
-    """Stamped on every score. Editing profile.md (or the instructions) changes it, and papers scored
-    against the old version get re-scored, newest first."""
-    return hashlib.sha1(f"{INSTRUCTIONS}\n{load_profile()}".encode()).hexdigest()[:8]
+    """Stamped on every score. Editing profile.md, the instructions or the Bio tabs changes it, and papers
+    scored against the old version get re-scored, newest first."""
+    return hashlib.sha1(f"{instructions()}\n{load_profile()}".encode()).hexdigest()[:8]
 
 
 def needs_score(p: dict, version: str) -> bool:
@@ -81,7 +103,7 @@ def titles(entries: dict, by_id: dict[str, dict], limit: int) -> list[str]:
 
 
 def system_prompt(favorites: list[str], liked: list[str]) -> str:
-    text = f"{INSTRUCTIONS}\n\n<reader_profile>\n{load_profile()}\n</reader_profile>"
+    text = f"{instructions()}\n\n<reader_profile>\n{load_profile()}\n</reader_profile>"
     if favorites:
         text += ("\n\n<their_favorite_papers>\nPapers they picked as defining their interests — the strongest "
                  "signal of what they care about:\n" + "\n".join(f"- {t}" for t in favorites)
@@ -118,12 +140,13 @@ def user_message(chunk: list[dict]) -> str:
 
 def apply_scores(text: str, ids: list[str], by_id: dict[str, dict]) -> int:
     """Write the model's JSON answer onto the papers it covers; returns how many it scored."""
-    scored = 0
+    scored, valid = 0, {s for s, _ in bio_topics()}
     for item in json.loads(text).get("papers", []):
         n = item.get("n", 0)
         if 1 <= n <= len(ids) and (p := by_id.get(ids[n - 1])):
             p["ai"] = {"score": max(0, min(10, int(item["score"]))),
-                       "tldr": item["tldr"].strip(), "why": item["why"].strip(), "v": profile_version()}
+                       "tldr": item["tldr"].strip(), "why": item["why"].strip(),
+                       "topics": [t for t in item.get("topics", []) if t in valid], "v": profile_version()}
             scored += 1
     return scored
 
@@ -137,7 +160,7 @@ def submit(client, papers: list[dict], system: str) -> dict:
             "max_tokens": 8000,  # ~1,500 tokens of JSON for 20 papers, plus room for thinking
             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": user_message(chunk)}],
-            "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
+            "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema()}},
         },
     } for i, chunk in enumerate(chunks)]
     batch = client.messages.batches.create(requests=requests)
@@ -191,7 +214,7 @@ def openrouter_json(c: httpx.Client, system: str, user: str, schema: dict, max_t
 
 
 def openrouter_call(c: httpx.Client, system: str, chunk: list[dict]) -> dict:
-    return openrouter_json(c, system, user_message(chunk), SCHEMA)
+    return openrouter_json(c, system, user_message(chunk), schema())
 
 
 def complete_json(system: str, user: str, schema: dict) -> dict | None:
@@ -244,7 +267,9 @@ def score_chunk(c: httpx.Client, system: str, chunk: list[dict], by_id: dict[str
 
 
 def run_openrouter(todo: list[dict], system: str, by_id: dict[str, dict], log) -> None:
-    todo = sorted(todo, key=lambda p: p.get("date", ""), reverse=True)[:MAX_PER_RUN]
+    # Newest first, but journal papers still waiting for a topic go ahead of everything else.
+    needs_topic = lambda p: p.get("kind") == "article" and not p.get("topics")
+    todo = sorted(todo, key=lambda p: (needs_topic(p), p.get("date", "")), reverse=True)[:MAX_PER_RUN]
     headers = {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}", "X-Title": "biopapers"}
     with httpx.Client(timeout=180, headers=headers) as c, ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(lambda ch: score_chunk(c, system, ch, by_id), chunked(todo)))

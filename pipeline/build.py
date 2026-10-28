@@ -381,9 +381,9 @@ def main() -> None:
             in_window.setdefault(a, p)
     extras = favorites.load(synced, in_window, log)
 
-    # Journal papers no rule tagged get scored too, and stay if they matter to you (AI score) or sit
-    # among papers of one topic (similarity). Scores of the ones dropped are remembered, so a paper
-    # OpenAlex keeps listing for a week or two isn't re-scored every day.
+    # Journal papers no rule tagged get scored too, and stay if Claude files them under a tab, if they
+    # matter to you (AI score), or if they sit among papers of one topic (similarity). Scores of the ones
+    # dropped are remembered, so a paper OpenAlex keeps listing for a week or two isn't re-scored every day.
     dropped_before = (fetch_json(args.previous, "ai_dropped.json") or {}).get("papers", {})
     for p in untagged:
         if not p.get("ai") and p["id"] in dropped_before:
@@ -396,13 +396,19 @@ def main() -> None:
                 papers[p["id"]]["ai"] = p["ai"]
     (OUT_DIR / "ai_pending.json").write_text(json.dumps({"batches": pending}))
 
+    filed = set()
+    for p in untagged:
+        if topics := [t for t in (p.get("ai") or {}).get("topics", []) if tagger.section_of.get(t) == "bio"]:
+            p["topics"] = topics
+            filed.add(p["id"])
     vecs, similar = {}, set()
     if "embed" in only:
         previous_vecs = {k: v for k, v in embed.load_previous(args.previous).items() if k not in refreshed}
         vecs = embed.vectors(final + untagged + extras, previous_vecs, log)
-        similar = {p["id"] for p in tagging.by_similarity(untagged, final, vecs, tagger.section_of)}
+        similar = {p["id"] for p in tagging.by_similarity([p for p in untagged if p["id"] not in filed],
+                                                          final, vecs, tagger.section_of)}
     relevant = lambda p: (s := (p.get("ai") or {}).get("score")) is not None and s >= KEEP_UNTAGGED_SCORE
-    kept = [p for p in untagged if p["id"] in similar or relevant(p)]
+    kept = [p for p in untagged if p["id"] in filed or p["id"] in similar or relevant(p)]
     for p in kept:
         p["sections"] = ["bio"]
     kept_ids = {p["id"] for p in kept}
@@ -410,7 +416,8 @@ def main() -> None:
         p["id"]: {"score": p["ai"]["score"], "v": p["ai"].get("v"), **({"declined": True} if p["ai"].get("declined") else {})}
         for p in untagged if p["id"] not in kept_ids and p.get("ai")}}, separators=(",", ":")))
     log(f"  untagged journal papers: {len(kept)} of {len(untagged)} kept "
-        f"({len(similar)} tagged by similarity, {sum(relevant(p) and p['id'] not in similar for p in kept)} by AI score)")
+        f"({len(filed)} filed by Claude, {len(similar)} tagged by similarity, "
+        f"{sum(relevant(p) and p['id'] not in filed | similar for p in kept)} by AI score alone)")
     final = sorted(final + [trim(p, tagger) for p in kept], key=lambda p: (p["date"], p.get("buzz_score", 0)), reverse=True)
     extras = [e for e in extras if e["id"] not in kept_ids]
 
