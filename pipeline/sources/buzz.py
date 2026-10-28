@@ -1,7 +1,7 @@
 """Attention signals — "is this paper blowing up?"
 
-  - X/Twitter (paid, pay-per-use API) — the most-engaged posts linking to papers, one query for bio
-    venues and one for CS (arXiv etc.), each capped at a post budget. Needs X_BEARER_TOKEN.
+  - X/Twitter (paid, pay-per-use API) — posts linking to papers above a like threshold, one query for
+    bio venues and one for CS (arXiv etc.), each capped at a post budget. Needs X_BEARER_TOKEN.
   - Hacker News (Algolia search API, free, no key) — stories linking to papers
   - ScienceDaily top stories — press coverage, resolved to the paper's DOI.
 
@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import feedparser
 
-from ..common import client, find_doi, norm_doi
+from ..common import BIORXIV_PREFIXES, client, find_doi, norm_doi
 
 PAPER_DOMAINS = ["biorxiv.org", "medrxiv.org", "nature.com", "science.org", "cell.com",
                  "arxiv.org", "doi.org", "pnas.org", "elifesciences.org",
@@ -41,7 +41,7 @@ def doi_from_url(url: str) -> str | None:
     if m := re.search(r"elifesciences\.org/(?:articles|reviewed-preprints)/(\d+)", url):
         return f"10.7554/elife.{m.group(1)}"
     doi = find_doi(url)
-    if doi and doi.startswith("10.1101/"):  # bioRxiv/medRxiv URL suffixes
+    if doi and doi.startswith(BIORXIV_PREFIXES):  # bioRxiv/medRxiv URL suffixes
         doi = norm_doi(re.sub(r"(\.full(\.pdf)?|\.abstract|\.supplementary-material|\.article-.*)$", "", doi))
     return doi
 
@@ -90,65 +90,79 @@ def hackernews(days: int) -> dict[str, dict]:
 
 
 X_SEARCH = "https://api.x.com/2/tweets/search/recent"
+X_COUNTS = "https://api.x.com/2/tweets/counts/recent"
+X_TIME = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _x_query(domains: list[str], min_likes: int) -> str:
-    q = "(" + " OR ".join(f'url:"{d}"' for d in domains) + ") -is:retweet"
+def _x_query(terms: list[str], min_likes: int) -> str:
+    # Plain `url:"<domain>"` misses most publisher links in X's index (8 bioRxiv posts a week, against
+    # 298 for the bare word), so the terms mix url: tokens and keywords — see config/sources.yaml.
+    q = "(" + " OR ".join(terms) + ") has:links -is:retweet"
     return q + (f" min_likes:{min_likes}" if min_likes else "")
 
 
-def x(hours: float, queries: dict[str, dict], log=print) -> dict[str, dict]:
-    """The most-engaged X posts of the last `hours` linking to papers. `queries` is
-    {name: {"domains": [...], "max_posts": n, "min_likes": n}}: each is billed per post read, so each
-    stops at its budget. Relevancy order puts the most-engaged posts first, so a budget cuts the tail."""
+def x(start: float, end: float, queries: dict[str, dict], log=print) -> dict[str, dict]:
+    """Every X post between `start` and `end` (epoch seconds) linking to papers, above a like threshold.
+    `queries` is {name: {"terms": [...], "max_posts": n, "min_likes": [n, ...]}}. X bills per post read,
+    so each query first counts its posts (counts are billed per request, not per post) at each threshold
+    and reads at the lowest one that fits `max_posts`: the whole popular set, not a sample. (Most-liked-
+    first ordering would be simpler, but X stops it after ~150 posts.)"""
     token = os.environ.get("X_BEARER_TOKEN")
     if not token:
         log("    x: no X_BEARER_TOKEN, skipped")
         return {}
-    start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - hours * 3600))
+    window = {"start_time": time.strftime(X_TIME, time.gmtime(start)), "end_time": time.strftime(X_TIME, time.gmtime(end))}
     shares = []
+
+    def call(c, url, name, params):
+        resp = c.get(url, params=params)
+        if resp.is_error:
+            log(f"    x {name}: HTTP {resp.status_code} {resp.text[:300]}")
+        resp.raise_for_status()
+        return resp.json()
+
     with client(timeout=30) as c:
         c.headers["Authorization"] = f"Bearer {token}"
         for name, q in queries.items():
-            budget, read, token_next = q.get("max_posts", 300), 0, None
-            min_likes = q.get("min_likes", 0)
+            budget = q.get("max_posts", 300)
+            counts = {}
+            for likes in q.get("min_likes", [0]):
+                meta = call(c, X_COUNTS, name, {"query": _x_query(q["terms"], likes), "granularity": "day", **window})
+                counts[likes] = meta.get("meta", {}).get("total_tweet_count", 0)
+                if counts[likes] <= budget:
+                    break
+            if counts[likes] > budget:
+                log(f"    x {name}: {counts[likes]} posts even at {likes}+ likes — reading the newest {budget}")
+            read, token_next = 0, None
             while read < budget:
-                params = {"query": _x_query(q["domains"], min_likes), "start_time": start,
-                          "max_results": max(10, min(100, budget - read)), "sort_order": "relevancy",
+                params = {"query": _x_query(q["terms"], likes), **window, "sort_order": "recency",
+                          "max_results": max(10, min(100, budget - read)),
                           "tweet.fields": "public_metrics,entities,author_id",
                           "expansions": "author_id", "user.fields": "username"}
                 if token_next:
                     params["next_token"] = token_next
-                resp = c.get(X_SEARCH, params=params)
-                if resp.status_code == 400 and min_likes and not read:
-                    log(f"    x {name}: min_likes rejected ({resp.text[:200]}), retrying without")
-                    min_likes = 0
-                    continue
-                if resp.status_code == 429:
-                    log(f"    x {name}: rate limited, stopping at {read} posts")
-                    break
-                if resp.is_error:
-                    log(f"    x {name}: HTTP {resp.status_code} {resp.text[:300]}")
-                resp.raise_for_status()
-                data = resp.json()
+                data = call(c, X_SEARCH, name, params)
                 users = {u["id"]: u.get("username", "") for u in (data.get("includes") or {}).get("users", [])}
                 posts = data.get("data") or []
                 read += len(posts)
                 for t in posts:
                     m = t.get("public_metrics") or {}
                     eng = m.get("like_count", 0) + m.get("retweet_count", 0) + m.get("quote_count", 0)
-                    urls = [u.get("unwound_url") or u.get("expanded_url") or ""
-                            for u in (t.get("entities") or {}).get("urls", [])]
-                    for doi in {d for u in urls if (d := doi_from_url(u))}:
+                    links = (t.get("entities") or {}).get("urls", [])
+                    # expanded_url is the link as posted; unwound_url follows redirects (doi.org -> the
+                    # paper, but also a ScienceDirect link -> its login page), so try both.
+                    dois = {d for u in links for k in ("expanded_url", "unwound_url") if (d := doi_from_url(u.get(k) or ""))}
+                    for doi in dois:
                         handle = users.get(t["author_id"], "")
                         shares.append((doi, t["author_id"], handle, eng,
                                        f"https://x.com/{handle or 'i'}/status/{t['id']}"))
                 if not (token_next := (data.get("meta") or {}).get("next_token")) or not posts:
                     break
-            log(f"    x {name}: {read} posts read")
-    # One day of posts: an account sharing 5+ different papers is an aggregator.
-    out = by_account(shares, "x", max_papers=4)
-    for doi, _, _, eng, url in sorted(people(shares, 4), key=lambda s: s[3]):
+            tried = ", ".join(f"{n}+ likes: {v}" for n, v in counts.items())
+            log(f"    x {name}: counted {tried} · read {read} posts at {likes}+ likes")
+    # Two days of posts: an account sharing 7+ different papers is an aggregator (or a journal's own).
+    out = by_account(shares, "x", max_papers=6)
+    for doi, _, _, eng, url in sorted(people(shares, 6), key=lambda s: s[3]):
         out[doi]["x_url"] = url  # the most-engaged post (sorted ascending, so the last one wins)
     return out
 

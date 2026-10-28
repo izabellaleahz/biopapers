@@ -17,6 +17,7 @@ CONFIG_DIR = ROOT / "config"
 
 USER_AGENT = "Mozilla/5.0 (compatible; biopapers/1.0; +https://github.com/shranchi0/biopapers)"
 
+BIORXIV_PREFIXES = ("10.1101/", "10.64898/")  # bioRxiv/medRxiv: the old prefix, and the one since 2025
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>?#&]+")
 TAG_RE = re.compile(r"<[^>]+>")
 
@@ -91,7 +92,7 @@ def norm_doi(doi: str | None) -> str | None:
         return None
     doi = doi.strip().lower()
     doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:)", "", doi)
-    doi = re.sub(r"v\d+$", "", doi) if doi.startswith("10.1101/") else doi  # bioRxiv version suffix
+    doi = re.sub(r"v\d+$", "", doi) if doi.startswith(BIORXIV_PREFIXES) else doi  # bioRxiv version suffix
     return doi.rstrip(".,;)") or None
 
 

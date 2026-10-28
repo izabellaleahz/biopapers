@@ -127,19 +127,24 @@ buzz:
   sciencedaily: true    # press coverage — ScienceDaily top stories, resolved to DOIs
   lookback_days: 7
   x:                    # X/Twitter recent search — paid, billed per post read (needs X_BEARER_TOKEN).
-                        # Each query reads its most-engaged posts first, up to max_posts per pull.
-                        # 600 posts a pull, every other day ≈ $1.50/day at $0.005/post (check the Developer
+                        # Each pull counts each query's posts at each like threshold (billed per request,
+                        # about $0.01) and reads every post at the lowest threshold that fits max_posts.
+                        # ~450 posts a pull every other day ≈ $1.10/day at $0.005/post (check the Developer
                         # Console's rate card). Billing is per post, not per pull: pulling less often costs
-                        # less and only delays a breakout paper by up to two days — most-liked-first means
-                        # the window's big posts are still caught, with likes that have had time to build.
+                        # less and only delays a breakout paper by up to two days.
     min_hours: 44       # every other day with the daily 12:00 UTC cron (slack for late runs); pushes rebuild too
+    lag_hours: 12       # read posts once they're this old, so their likes have built up
+    # Terms are X query operators. `url:"<domain>"` misses most publisher links in X's index (a week in
+    # Oct 2026: bioRxiv 8 posts, against 298 for the bare word `biorxiv`; NEJM 3, against 69 for url:nejm),
+    # so these are bare url: tokens and keywords, measured with the counts endpoint. eLife and PLOS match
+    # almost nothing on X. Posts whose links don't resolve to a paper cost a read and are dropped.
     queries:
-      bio:
+      bio:              # a week: ~3,000 posts with 5+ likes, ~1,700 with 10+, ~900 with 20+, ~340 with 50+
         max_posts: 300
-        min_likes: 5    # only posts someone noticed — keeps bots and self-promotion out of the bill
-        domains: [biorxiv.org, medrxiv.org, nature.com, science.org, cell.com, pnas.org,
-                  elifesciences.org, nejm.org, doi.org]
-      cs:
+        min_likes: [5, 10, 20, 50, 100]
+        terms: ['url:"doi.org"', 'url:nature', 'url:science', 'url:cell', 'url:pnas', 'url:nejm',
+                'biorxiv', 'medrxiv']
+      cs:               # a week: ~670 posts with 10+ likes, ~390 with 20+, ~180 with 50+
         max_posts: 300
-        min_likes: 10   # ML Twitter is louder
-        domains: [arxiv.org, huggingface.co/papers, alphaxiv.org]
+        min_likes: [10, 20, 50, 100]
+        terms: ['url:"arxiv.org"', 'url:"huggingface.co/papers"', 'alphaxiv']

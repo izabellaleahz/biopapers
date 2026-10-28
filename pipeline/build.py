@@ -147,19 +147,26 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger,
         fetchers = {"hackernews": (buzz.hackernews, look), "sciencedaily": (buzz.sciencedaily,)}
         if (xc := cfg.get("x")) and xc.get("queries") and buzz_state is not None:
             # X bills per post read, and every push to main rebuilds too: pull at most once per
-            # `min_hours`, covering the whole gap since the last pull (recent search reaches back 7 days;
-            # the first pull takes all of it, so Trending starts full).
-            last = buzz_state.get("x_last")
-            x_hours = (time.time() - dt.datetime.fromisoformat(last).timestamp()) / 3600 if last else None
-            if x_hours is not None and x_hours < xc.get("min_hours", 20):
+            # `min_hours`. Each pull reads posts from where the last one stopped (`x_until`; recent search
+            # reaches back 7 days, so the first pull takes all of it) up to `lag_hours` ago, so a post's
+            # likes have had time to build before its like threshold is checked.
+            stamp = lambda key: dt.datetime.fromisoformat(buzz_state[key]).timestamp() if buzz_state.get(key) else None
+            now = time.time()
+            x_hours = (now - last) / 3600 if (last := stamp("x_last")) else None
+            start = max(stamp("x_until") or 0, now - 167 * 3600)
+            end = now - xc.get("lag_hours", 12) * 3600
+            if x_hours is not None and x_hours < xc.get("min_hours", 20) and not os.environ.get("X_FORCE"):
                 log(f"  buzz x: last pulled {x_hours:.0f}h ago, skipped")
-            else:
-                def pull_x(hours):
-                    out = buzz.x(hours, xc["queries"], log)
+            elif end > start + 3600:
+                def pull_x():
+                    out = buzz.x(start, end, xc["queries"], log)
                     if os.environ.get("X_BEARER_TOKEN"):  # it ran (a failure raises): the posts are billed
-                        buzz_state["x_last"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+                        iso = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).isoformat(timespec="seconds")
+                        buzz_state["x_last"], buzz_state["x_until"] = iso(now), iso(end)
                     return out
-                fetchers["x"] = (pull_x, min(167, max(26, x_hours + 2)) if x_hours is not None else 167)
+                fetchers["x"] = (pull_x,)
+            else:
+                log("  buzz x: nothing new to read yet")
         for name, (fn, *args) in fetchers.items():
             if cfg.get(name):
                 for doi, sig in timed(f"buzz {name}", fn, *args).items():

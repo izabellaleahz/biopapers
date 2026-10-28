@@ -153,7 +153,7 @@ committing data. Optional repo secrets/variables:
 
 | Name | Kind | Why |
 |------|------|-----|
-| `X_BEARER_TOKEN` | secret | X recent search for the most-engaged posts linking to papers — paid per post read, budgeted in `config/sources.yaml` (`buzz.x`), pulled every other day |
+| `X_BEARER_TOKEN` | secret | X recent search for posts linking to papers above a like threshold — paid per post read, budgeted in `config/sources.yaml` (`buzz.x`), pulled every other day |
 | `OPENALEX_MAILTO` | variable | Contact email for OpenAlex's polite pool |
 | `OPENALEX_API_KEY` | secret | If OpenAlex rate-limits anonymous use |
 | `ANTHROPIC_API_KEY` | secret | AI scores + TL;DRs via Anthropic (batch, cheapest) |
@@ -165,8 +165,10 @@ committing data. Optional repo secrets/variables:
 - **Votes/saves** live in localStorage; turn on Gist sync to carry them across browsers (needs a
   GitHub token with only the `gist` scope, pasted once per device). Shared lab votes would need a
   small backend (e.g. Supabase) — see `CONSIDERATIONS.md`.
-- **X is budgeted, not complete** — each pull (every other day) reads only the few hundred most-engaged posts per
-  query (bio venues; arXiv/HF), so it finds what's popular but undercounts the long tail. Buzz counts
+- **X is budgeted, not complete** — each pull (every other day) reads every post above the lowest like
+  threshold that fits the budget (checked with X's counts endpoint), per query (bio venues; arXiv/HF), so
+  it finds what's popular but skips the long tail of barely-liked posts. bioRxiv is rare on X (~30 posts a
+  week with 5+ likes); bio attention there is mostly journal papers. Buzz counts
   distinct people sharing a paper on X (accumulated across days in `buzz_state.json`), not posts,
   and drops bots/aggregators. Off-topic papers only reach Trending if OpenAlex files them under biology
   or CS.

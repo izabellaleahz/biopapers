@@ -8,6 +8,10 @@ on:
       days:
         description: "Fetch lookback in days (use 30 for a fresh backfill)"
         default: "3"
+      x_now:
+        description: "Pull X now even if the last pull was under 44h ago (billed)"
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -52,6 +56,7 @@ jobs:
         env:
           SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}  # X recent search, pay-per-use (config/sources.yaml buzz.x)
+          X_FORCE: ${{ inputs.x_now && '1' || '' }}      # the x_now input: skip the every-other-day cooldown
           OPENALEX_MAILTO: ${{ vars.OPENALEX_MAILTO }}
           OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
