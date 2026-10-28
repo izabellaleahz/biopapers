@@ -9,14 +9,19 @@
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks", "explored", "pis"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks", "explored", "pis", "issued"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs", "learn"];
 const DAY = 86400000;
 const MUST_READ = 6; // AI score (0–10) at which a paper lands in "Must read"
 const NEAR_K = 25; // each favorite pulls its 25 most similar papers into "Near favorites"
+// Today: a short daily issue (see the "today" section). Everything Must read or from a watched PI, topped
+// up to ISSUE_MIN from the For You ranking, at most ISSUE_MAX (more after days away, up to ISSUE_BACKLOG).
+const ISSUE_MIN = 5, ISSUE_MAX = 12, ISSUE_BACKLOG = 25, PULL = 5;
+const QUEUE_DAYS = 7, QUEUE_DAYS_TOP = 14, QUEUE_TOP = 7; // unseen papers leave the queue after a week (2 if AI 7+)
 
 // Fixed tabs around each section's topic tabs (from config/topics.yaml).
 const SPECIAL_TABS = {
+  today: { label: "Today", color: "var(--accent)" },
   foryou: { label: "For You", color: "var(--ink)" },
   pis: { label: "PI Watch", color: "#a98fd6" },
   buzz: { label: "Buzz", color: "var(--hot)" },
@@ -25,7 +30,7 @@ const SPECIAL_TABS = {
   saved: { label: "Saved", color: "#f2b15c" },
 };
 const SECTION_TABS = {
-  bio: { head: ["foryou"], tail: ["pis", "buzz", "saved"] },
+  bio: { head: ["today", "foryou"], tail: ["pis", "buzz", "saved"] },
   ml: { head: ["mlforyou", "trending"], tail: ["pis", "saved"] },
 };
 // Signed out, each section shows only what's trending in it.
@@ -49,10 +54,10 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, explored: {}, pis: {}, removed: {}, settingsAt: 0,
+  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, explored: {}, pis: {}, issued: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(FEATURES).map(([k, w]) => [k, w.def])), learn: true, clicks: {},
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
-  section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
+  section: "bio", tabBy: { bio: "today", ml: "mlforyou" }, sortByTab: {},
   lastVisit: null, prevVisit: null, view: "feed", graphSection: "all", graphAround: true,
 });
 
@@ -89,12 +94,14 @@ function persist() {
   scheduleSync();
 }
 
-// Count a visit only if the last one was >1h ago, so reloads don't clear "new".
+// Count a visit only if the last one was >1h ago, so reloads don't clear "new". A new visit opens on Today.
+let freshVisit = false;
 (function trackVisit() {
   const now = Date.now();
   if (!state.lastVisit || now - state.lastVisit > 3600000) {
     state.prevVisit = state.lastVisit;
     state.lastVisit = now;
+    freshVisit = true;
     persist();
   }
 })();
@@ -109,6 +116,7 @@ let mlLoaded = null; // promise once ml.json is requested
 let VEC = null; // { dim, data: Int8Array, norms, index: Map(id -> row) } once vectors load
 let MAP = null, mapLoaded = null; // { ids, xy, nn, index } once map.json loads
 let favsLoaded = null; // favorites.json: favorites outside the window (on the graph, not in feeds)
+let olderLoaded = false, vecTried = false; // Today waits for both, so its issue is ranked on everything
 
 const curTab = () => state.tabBy[state.section];
 const setTab = (t) => { state.tabBy[state.section] = t; };
@@ -151,24 +159,28 @@ async function load() {
   maybeOnboard();
   if (state.section === "ml") await loadML();
   addPapers(await fetchPapers("older.json"));
+  olderLoaded = true;
   pruneLogs();
   migrateVotes();
   render({ keepPage: true });
   loadVectors();
 }
 
-// Clicks and exploration records only matter for recent ranking: drop them after 90 days.
+// Clicks, exploration and issue records only matter for recent ranking: drop them after 90 days.
 function pruneLogs() {
   const cut = Date.now() - 90 * DAY;
   let changed = false;
-  for (const m of ["clicks", "explored"]) {
+  for (const m of ["clicks", "explored", "issued"]) {
     for (const [id, v] of Object.entries(state[m])) if (entryTs(v) < cut) { delete state[m][id]; changed = true; }
   }
   if (changed) persist();
 }
 
 let vecLoading = null;
-function loadVectors() { vecLoading ||= readVectors(); return vecLoading; }
+function loadVectors() {
+  vecLoading ||= readVectors().finally(() => { vecTried = true; if (!VEC) render({ keepPage: true }); });
+  return vecLoading;
+}
 async function readVectors() {
   try {
     const [meta, buf] = await Promise.all([
@@ -312,6 +324,9 @@ function trainingSet() {
   add(Object.keys(state.clicks), 1);
   const neg = new Map(Object.keys(state.hidden)
     .filter((id) => byId.has(id) && !pos.has(id) && hideReason(id) !== "read").map((id) => [id, 2]));
+  // Papers an earlier Today issue handed you that you did nothing with: a weak "not for me".
+  for (const [id, e] of Object.entries(state.issued))
+    if (e.day < localDay() && byId.has(id) && !pos.has(id) && !state.hidden[id]) neg.set(id, 0.5);
   const unlabeled = DATA.papers.filter((p) => !pos.has(p.id) && !neg.has(p.id) && !has(state.hidden, p))
     .sort((a, b) => hash32(a.id) - hash32(b.id)).slice(0, Math.max(60, 3 * pos.size));
   for (const p of unlabeled) neg.set(p.id, 0.5);
@@ -594,6 +609,7 @@ function tabInfo(slug) {
 
 function inTab(p, tab) {
   if (!(p.sections || ["bio"]).includes(state.section)) return false;
+  if (tab === "today") return state.issued[p.id]?.day === localDay() && !cleared(p);
   // Journal papers that fit no topic tab still belong in For You when Claude rates them relevant.
   if (tab === "foryou") return (sectionTopics(p).length || myPis(p).length || (p.ai?.score ?? 0) >= 4) && topicWeight(p) > 0;
   if (tab === "mlforyou") return topicWeight(p) > 0;
@@ -654,6 +670,11 @@ const sortFor = (tab) => {
 
 function visiblePapers() {
   const tab = curTab();
+  if (tab === "today") {
+    const q = ui.query.toLowerCase();
+    return todayIssue().filter((p) => !cleared(p)
+      && (!q || `${p.title} ${p.authors.join(" ")} ${p.abstract} ${p.venue}`.toLowerCase().includes(q)));
+  }
   let list = tab === "saved" ? savedPapers() : DATA.papers.filter((p) => inTab(p, tab) && !has(state.hidden, p));
   if (tab === "pis" && ui.pi) list = list.filter((p) => myPis(p).includes(ui.pi));
   if ((tab === "foryou" || tab === "mlforyou") && ui.forYou) list = list.filter(forYouChip(ui.forYou));
@@ -677,6 +698,100 @@ function visiblePapers() {
   return ui.query ? scored.map(([, p]) => p) : diversify(scored, rk);
 }
 
+// ---- today ---------------------------------------------------------------
+// A short issue you can finish, instead of a feed with no end. Each day's issue is made once, from the
+// queue: For You papers you haven't been handed yet, added in the last week (two for AI 7+). It takes
+// everything Must read or from a watched PI, tops up to ISSUE_MIN from the ranking, and stops at
+// ISSUE_MAX, or more after days away, so a week off gives one best-of issue rather than a backlog. Its
+// papers go in `issued` (synced), so the issue stays put across reloads and devices. A card clears with
+// ★, ♥, ✕ or ✓; "More" then pulls, one step at a time: the rest of the papers new since your last issue,
+// then this week's you haven't seen, then one from outside your areas.
+
+const localDay = (t = Date.now()) => new Date(t - new Date(t).getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+const cleared = (p) => has(state.saved, p) || has(state.favorites, p) || has(state.hidden, p);
+const issueReady = () => !!account.user && olderLoaded && (!!VEC || vecTried);
+const issueKey = (day) => `issue:${day}`;  // marks a day's issue as made, even when it came out empty
+
+function lastIssueDay() {
+  const day = localDay();
+  return Object.values(state.issued).reduce((m, e) => (e.day < day && e.day > m ? e.day : m), "") || null;
+}
+
+function todayIssue() {
+  const day = localDay();
+  return Object.entries(state.issued).filter(([, e]) => e.day === day).sort((a, b) => a[1].ts - b[1].ts)
+    .map(([id]) => byId.get(id)).filter(Boolean);
+}
+
+// The queue, best first.
+function issueQueue() {
+  const cut = localDay(Date.now() - QUEUE_DAYS * DAY), cutTop = localDay(Date.now() - QUEUE_DAYS_TOP * DAY);
+  const rk = ranker(), now = Date.now();
+  return DATA.papers
+    // Published in the last two weeks too: a build that newly tags old papers mustn't flood the queue.
+    .filter((p) => inTab(p, "foryou") && !cleared(p) && !has(state.issued, p) && p.date >= cutTop
+      && (p.added || p.date) >= ((p.ai?.score ?? 0) >= QUEUE_TOP ? cutTop : cut))
+    .map((p) => [rankScore(p, rk, now), p]).sort((a, b) => b[0] - a[0]).map(([, p]) => p);
+}
+
+// One good paper (in a journal, or getting attention) from a part of the map none of your ♥ / ☆ are in.
+function outsidePick() {
+  const cut = localDay(Date.now() - QUEUE_DAYS * DAY), rk = ranker();
+  const home = new Set([...Object.keys(state.favorites), ...Object.keys(state.saved)]
+    .map((id) => byId.get(id)?.region).filter((r) => r != null));
+  const worth = (p) => (p.ai?.score ?? 3) / 10 + Math.log1p(p.buzz_score || 0) / Math.log1p(20) + (p.kind === "article" ? 0.3 : 0);
+  return DATA.papers
+    .filter((p) => (p.sections || ["bio"]).includes("bio") && (p.added || p.date) >= cut && p.date >= cut && !cleared(p)
+      && !has(state.issued, p) && (p.kind === "article" || p.buzz_score > 0)
+      && (p.region != null && home.size ? !home.has(p.region) && (rk.regionDown.get(p.region) ?? 1) >= 1 : !inTab(p, "foryou")))
+    .sort((a, b) => worth(b) - worth(a)).slice(0, 1);
+}
+
+function addToIssue(papers, how) {
+  const day = localDay(), now = Date.now();
+  papers.forEach((p, i) => { state.issued[p.id] = { ts: now + i, day, how }; });
+  state.issued[issueKey(day)] ||= { ts: now, day };
+}
+
+function ensureIssue() {
+  const day = localDay();
+  if (state.section !== "bio" || !issueReady() || state.issued[issueKey(day)]) return;
+  const last = lastIssueDay();
+  const gap = last ? Math.max(1, Math.round((Date.parse(day) - Date.parse(last)) / DAY)) : 1;
+  const cap = Math.min(ISSUE_BACKLOG, ISSUE_MAX + 2 * (gap - 1));
+  const queue = issueQueue();
+  const pick = queue.filter((p) => myPis(p).length || (p.ai?.score ?? 0) >= MUST_READ)
+    .sort((a, b) => (myPis(b).length > 0) - (myPis(a).length > 0)).slice(0, cap);  // PIs first, then rank
+  for (const p of queue) { if (pick.length >= ISSUE_MIN) break; if (!pick.includes(p)) pick.push(p); }
+  addToIssue(pick, "issue");
+  setTimeout(persist, 0);  // not mid-render
+}
+
+// What "More" pulls next: the first step that has anything left.
+function nextPull() {
+  const queue = issueQueue(), since = lastIssueDay() || localDay(Date.now() - DAY);
+  const fresh = queue.filter((p) => p.added > since);
+  if (fresh.length) return { how: "fresh", papers: fresh.slice(0, PULL), label: `${Math.min(PULL, fresh.length)} more new since your last issue` };
+  if (queue.length) return { how: "week", papers: queue.slice(0, PULL), label: `${Math.min(PULL, queue.length)} from this week you haven't seen` };
+  const out = outsidePick();
+  if (out.length) return { how: "outside", papers: out, label: "1 paper from outside your areas" };
+  return null;
+}
+
+function todayHTML(list) {
+  if (!issueReady()) return `<div class="empty">Putting today's issue together…</div>`;
+  const all = todayIssue(), next = nextPull();
+  const head = !all.length ? "Nothing new since your last issue."
+    : list.length ? `${list.length} of ${all.length} left · clear each with ☆, ✕ or ✓`
+    : `You're caught up: all ${all.length} done.`;
+  return `<div class="today-head${all.length && !list.length ? " done" : ""}">${head}</div>${list.map(card).join("")}
+    <div class="today-more">
+      ${next ? `<button type="button" class="primary" data-pull="${next.how}">More: ${esc(next.label)}</button>`
+        : `<span>That's everything from the last week.</span>`}
+      <button type="button" data-pull="feed">Open the full feed</button>
+    </div>`;
+}
+
 // ---- rendering ---------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
@@ -685,6 +800,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 function render({ keepPage = false } = {}) {
   if (!keepPage) ui.shown = PAGE;
   const pub = !account.user;  // signed out: just what's trending
+  if (freshVisit && !pub && state.view !== "graph") { freshVisit = false; if (state.section === "bio") setTab("today"); }
   const tabs = allTabs().filter((t) => pub || !state.hiddenTabs.includes(t) || t === curTab());
   if (!tabs.includes(curTab())) setTab(pub ? tabs[0] : SECTION_TABS[state.section].head[0]);
   const tab = curTab();
@@ -707,6 +823,7 @@ function render({ keepPage = false } = {}) {
     return;
   }
   if (graph) { renderGraph(); return; }
+  if (!pub) ensureIssue();
 
   const visible = (p) => !has(state.hidden, p);
   const count = (t) => t === "saved" ? Object.keys(state.saved).length
@@ -719,12 +836,14 @@ function render({ keepPage = false } = {}) {
 
   const sort = sortFor(tab);
   const sortLabel = (k, label) => k === "buzz" && (state.section === "ml" || pub) ? "Hot" : label;
-  $("sortbar").innerHTML = tab === "saved" ? `<button class="active">Recently saved</button>`
+  $("sortbar").innerHTML = tab === "today" ? ""
+    : tab === "saved" ? `<button class="active">Recently saved</button>`
     : Object.entries(SORTS).filter(([k]) => !pub || k !== "foryou").map(([k, label]) =>
         `<button data-sort="${k}" class="${k === sort ? "active" : ""}">${sortLabel(k, label)}</button>`).join("");
 
   const nNew = DATA.papers.filter((p) => isNew(p) && inTab(p, tab === "saved" ? SECTION_TABS[state.section].head[0] : tab)).length;
   $("new-label").textContent = prevVisitDay ? `new since last visit (${nNew})` : "new since last visit";
+  $("new-only").closest("label").hidden = tab === "today";  // Today is new papers already
 
   const myPiList = Object.values(state.pis).sort((a, b) => a.name.localeCompare(b.name));
   $("chips").innerHTML = tab === "pis" && myPiList.length
@@ -749,6 +868,11 @@ function render({ keepPage = false } = {}) {
 
   const list = visiblePapers();
   ui.lastCount = list.length;
+  if (tab === "today") {
+    $("feed").innerHTML = todayHTML(list);
+    $("more").hidden = true;
+    return;
+  }
   $("feed").innerHTML = list.length
     ? list.slice(0, ui.shown).map(card).join("")
     : `<div class="empty">${tab === "saved" ? "Nothing saved yet — hit ☆ on a paper."
@@ -800,6 +924,7 @@ function card(p) {
       <button class="${saved ? "on" : ""}" data-act="save" aria-label="Save" title="Save">${saved ? "★" : "☆"}</button>
       <button class="${fav ? "on fav" : ""}" data-act="fav" aria-label="Favorite" title="Favorite: a landmark paper the Graph and Near favorites center on">♥</button>
       <button class="hide" data-act="hide" aria-label="${curTab() === "saved" ? "Unsave" : "Not interested"}" title="${curTab() === "saved" ? "Unsave" : "Not interested: hide it, and rank papers like it lower"}">✕</button>
+      ${curTab() === "today" ? `<button data-act="done" aria-label="Done" title="Done: read it (or enough of it), clear it from Today">✓</button>` : ""}
     </div>`}
     <div class="body">
       <h3><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
@@ -875,6 +1000,13 @@ function toggleFavorite(p) {
 }
 
 $("feed").addEventListener("click", (e) => {
+  const pull = e.target.closest("[data-pull]");
+  if (pull) {
+    if (pull.dataset.pull === "feed") { setTab("foryou"); persist(); render(); window.scrollTo({ top: 0 }); return; }
+    const next = nextPull();
+    if (next) { addToIssue(next.papers, next.how); persist(); render({ keepPage: true }); }
+    return;
+  }
   const opened = e.target.closest(".paper h3 a");
   if (opened) { state.clicks[opened.closest(".paper").dataset.id] = Date.now(); affinityCache = null; persist(); return; }
   const abs = e.target.closest(".abstract");
@@ -890,6 +1022,13 @@ $("feed").addEventListener("click", (e) => {
   if (act === "takehome-redo") { takeHome(p, { redo: true }); return; }
   if (act === "fav") toggleFavorite(p);
   if (act === "save") toggle("saved", p, { ts: Date.now(), paper: snapshot(p) });
+  if (act === "done") {
+    state.hidden[p.id] = { ts: Date.now(), reason: "read", ...(p.region != null ? { r: p.region } : {}) };
+    const t = $("toast");
+    t.innerHTML = `<span>Done.</span><button type="button" data-why="undo" class="undo">Undo</button>`;
+    t.dataset.id = p.id; t.hidden = false;
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 5000);
+  }
   if (act === "hide") {
     if (curTab() === "saved") toggle("saved", p);
     else { state.hidden[p.id] = { ts: Date.now(), ...(p.region != null ? { r: p.region } : {}) }; showHideToast(p); }
