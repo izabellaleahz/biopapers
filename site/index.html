@@ -68,7 +68,7 @@
         <button class="iconbtn" value="close" aria-label="Close">✕</button>
       </div>
 
-      <section>
+      <section class="acct">
         <h3>Account</h3>
         <div id="account-box"></div>
       </section>
@@ -96,8 +96,15 @@
       </section>
 
       <section>
+        <h3>PI watchlist</h3>
+        <p class="hint">New papers by these people fill your PI Watch tab and rank higher in For You. The daily
+          build also pulls their papers from journals the site has no feed for.</p>
+        <div id="pi-box"></div>
+      </section>
+
+      <section>
         <h3>Alerts</h3>
-        <p class="hint">Watched-PI papers and anything getting buzz are published as an RSS feed —
+        <p class="hint">Papers by the site's PIs (<code>config/people.yaml</code>) and anything getting buzz are published as an RSS feed —
           subscribe in any reader, or in Slack with <code>/feed subscribe</code>.</p>
         <p><a id="alerts-link" href="alerts.xml" target="_blank" rel="noopener">alerts.xml</a></p>
       </section>
@@ -124,6 +131,23 @@
         </div>
         <input type="file" id="import-file" accept="application/json" hidden>
       </section>
+    </form>
+  </dialog>
+
+  <dialog id="onboard" aria-label="Set up your feed">
+    <form method="dialog" class="settings onboard">
+      <div class="settings-head">
+        <h2>Set up your feed</h2>
+        <span class="hint" id="ob-step"></span>
+      </div>
+      <div id="ob-body"></div>
+      <p class="hint sync-error" id="ob-error"></p>
+      <div class="btnrow ob-nav">
+        <button type="button" id="ob-skip" class="quiet">Skip setup</button>
+        <span class="grow"></span>
+        <button type="button" id="ob-back">Back</button>
+        <button type="button" id="ob-next" class="primary">Next</button>
+      </div>
     </form>
   </dialog>
 

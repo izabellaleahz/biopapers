@@ -28,7 +28,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from .common import ROOT, client, load_config, read_gist_state, strip_label, title_key, today
-from . import ai, archive, embed, favorites, layout, tagging
+from . import ai, archive, embed, favorites, layout, tagging, users
 from .sources import buzz, europepmc, huggingface, journals, openalex, preprints
 from .tagging import Tagger
 
@@ -88,7 +88,8 @@ def timed(label: str, fn, *args) -> list | dict:
         return {} if label.startswith("buzz") else []
 
 
-def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger) -> tuple[list[dict], dict]:
+def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger,
+                     people: list[dict]) -> tuple[list[dict], dict]:
     sources = load_config("sources")
     pre = sources.get("preprints", {})
     papers: list[dict] = []
@@ -129,7 +130,7 @@ def fetch_everything(days: int, keep_days: int, only: set[str], tagger: Tagger) 
                                 f"title_and_abstract.search:{q}", keep_days)
 
     if "pis" in only:
-        for person in load_config("people").get("people", []):
+        for person in people:
             if aid := person.get("openalex"):
                 papers += timed(f"pi {person['name']}", openalex.works_by_filter,
                                 f"author.id:{aid}", PI_KEEP_DAYS)
@@ -309,11 +310,14 @@ def finalize(papers: dict[str, dict], tagger: Tagger, keep_days: int, ml_cfg: di
     return kept, untagged
 
 
-def write_alerts(papers: list[dict], site_url: str) -> None:
+def write_alerts(papers: list[dict], site_url: str, people: list[dict]) -> None:
+    """RSS of new papers by people.yaml's PIs (not users' own: the feed is public) and buzzing papers."""
     recent = (today() - dt.timedelta(days=14)).isoformat()
+    site_pis = {p["name"] for p in people}
     items = []
     for p in papers:
-        reasons = [f"PI: {', '.join(p['pis'])}"] if p["pis"] else []
+        pis = [n for n in p["pis"] if n in site_pis]
+        reasons = [f"PI: {', '.join(pis)}"] if pis else []
         bar = BUZZ_ALERT_SCORE_ML if p["sections"] == ["ml"] else BUZZ_ALERT_SCORE
         if p.get("buzz_score", 0) >= bar:
             reasons.append(f"buzz {p['buzz_score']:.0f}")
@@ -348,20 +352,22 @@ def main() -> None:
     topics_file = load_config("topics")
     topics_cfg = topics_file["topics"]
     people_cfg = load_config("people").get("people", [])
+    # Everyone's PIs are fetched and tagged; people.yaml's alone are the site's list (and the alerts').
+    watched = people_cfg + users.watched_pis(people_cfg, log)
     sections_cfg = topics_file.get("sections", {"bio": {"label": "Bio"}})
     if ml_journals := list(load_config("sources").get("ml", {}).get("journals", {})):
         # ML tabs only match arXiv papers (so a bioRxiv paper mentioning "protein" stays out of AI for
         # Science); the configured ML journals count as ML venues too.
         ml_sec = sections_cfg.setdefault("ml", {"label": "ML / CS"})
         ml_sec["only_venues"] = [*ml_sec.get("only_venues", []), *ml_journals]
-    tagger = Tagger(topics_cfg, people_cfg, sections_cfg)
+    tagger = Tagger(topics_cfg, watched, sections_cfg)
 
     previous = load_previous(args.previous)
     days = args.days if previous else max(args.days, args.backfill_days)
     log(f"previous: {len(previous)} papers · fetching last {days} days")
 
     only = set(args.only.split(","))
-    fresh, signals = fetch_everything(days, args.keep_days, only, tagger)
+    fresh, signals = fetch_everything(days, args.keep_days, only, tagger, watched)
     papers = merge(previous, fresh)
     enrich(papers, signals)
     refreshed = enrich_abstracts(papers) if "openalex" in only or "rss" in only else set()
@@ -438,7 +444,8 @@ def main() -> None:
         "sections": {k: v["label"] for k, v in sections_cfg.items()},
         "topics": [{"slug": t["slug"], "label": t["label"], "color": t["color"],
                     "section": t.get("section", "bio")} for t in topics_cfg],
-        "people": [{"name": p["name"], "note": p.get("note", "")} for p in people_cfg],
+        "people": [{"name": p["name"], "note": p.get("note", ""), **({"openalex": p["openalex"]} if p.get("openalex") else {})}
+                   for p in people_cfg],
         "regions": regions["labels"] if regions else (fetch_json(args.previous, "papers.json") or {}).get("regions", []),
         "papers": recent,
     }
@@ -451,7 +458,7 @@ def main() -> None:
     # Papers in both sections already ship in the bio files; ml.json holds the ML-only rest.
     ml_out.write_text(json.dumps({"papers": [p for p in final if p["sections"] == ["ml"]]},
                                  ensure_ascii=False, separators=(",", ":")))
-    write_alerts(final, args.site_url)
+    write_alerts(final, args.site_url, people_cfg)
     archived = archive.update(list(papers.values()), merge)
 
     counts = {t["slug"]: sum(t["slug"] in p["topics"] for p in final) for t in topics_cfg}

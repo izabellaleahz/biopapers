@@ -1,14 +1,15 @@
 // biopapers — static client. Loads data/papers.json (+ older.json and the embeddings in the
 // background, ml.json when the ML / CS section is opened, map.json + favorites.json for the
 // Graph), ranks and renders the feed.
-// Saves / upvotes / favorites / settings live in localStorage, optionally synced to a secret GitHub Gist.
+// Saves / upvotes / favorites / PIs / settings live in localStorage, synced to your account (or a secret
+// GitHub Gist). Signed out, the site is just what's trending: no personal tabs, ranking or scores.
 
 "use strict";
 
 const PAGE = 40;
 const STORE_KEY = "biopapers:v1";
 const SYNC_KEY = "biopapers:sync"; // { token, gistId } — kept apart so Export JSON never contains the token
-const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks", "explored"];
+const SYNC_MAPS = ["votes", "saved", "hidden", "favorites", "summaries", "clicks", "explored", "pis"];
 const SYNC_SETTINGS = ["weights", "topicWeights", "halfLife", "tabOrder", "hiddenTabs", "learn"];
 const DAY = 86400000;
 const MUST_READ = 6; // AI score (0–10) at which a paper lands in "Must read"
@@ -25,8 +26,10 @@ const SPECIAL_TABS = {
 };
 const SECTION_TABS = {
   bio: { head: ["foryou"], tail: ["pis", "buzz", "saved"] },
-  ml: { head: ["mlforyou", "trending"], tail: ["saved"] },
+  ml: { head: ["mlforyou", "trending"], tail: ["pis", "saved"] },
 };
+// Signed out, each section shows only what's trending in it.
+const PUBLIC_TABS = { bio: "buzz", ml: "trending" };
 const HOT_TABS = new Set(["buzz", "trending"]);
 
 // The ranking features, in the order features() returns them; `def` is the starting weight.
@@ -46,7 +49,7 @@ const SORTS = { foryou: "For You", date: "Newest", buzz: "Buzz" };
 // ---- state ---------------------------------------------------------------
 
 const defaults = () => ({
-  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, explored: {}, removed: {}, settingsAt: 0,
+  votes: {}, saved: {}, hidden: {}, favorites: {}, summaries: {}, explored: {}, pis: {}, removed: {}, settingsAt: 0,
   weights: Object.fromEntries(Object.entries(FEATURES).map(([k, w]) => [k, w.def])), learn: true, clicks: {},
   topicWeights: {}, halfLife: 7, tabOrder: [], hiddenTabs: [],
   section: "bio", tabBy: { bio: "foryou", ml: "mlforyou" }, sortByTab: {},
@@ -145,6 +148,7 @@ async function load() {
   if (!DATA.sections?.[state.section]) state.section = "bio";
   addPapers(papers);
   render();
+  maybeOnboard();
   if (state.section === "ml") await loadML();
   addPapers(await fetchPapers("older.json"));
   pruneLogs();
@@ -163,7 +167,9 @@ function pruneLogs() {
   if (changed) persist();
 }
 
-async function loadVectors() {
+let vecLoading = null;
+function loadVectors() { vecLoading ||= readVectors(); return vecLoading; }
+async function readVectors() {
   try {
     const [meta, buf] = await Promise.all([
       fetch("data/vectors.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)),
@@ -291,7 +297,7 @@ function features(p, rk, now) {
     sim("fav"), sim("saved"), sim("hidden"),
     Math.pow(0.5, age / state.halfLife),   // recency
     Math.min(1, Math.log1p(p.buzz_score || 0) / Math.log1p(20)),  // buzz
-    p.pis?.length ? 1 : 0,                 // pi
+    myPis(p).length ? 1 : 0,               // pi
     p.kind === "article" ? 1 : 0,          // journal (vs preprint)
   ];
 }
@@ -348,14 +354,16 @@ function ranker() {
     // and "already read" / "low quality" say nothing about the topic.
     REF.hidden.sync(recentIds(Object.fromEntries(Object.entries(state.hidden).filter(([id]) => !hideReason(id)))));
   }
+  const favRegions = favoriteRegions();
   const rk = { scale: VEC ? { fav: REF.fav.scale(), saved: REF.saved.scale(), hidden: REF.hidden.scale() } : {},
-               regionDown: regionDownweights() };
+               regionDown: regionDownweights(), regionUp: regionUpweights(favRegions), favRegions };
   affinityCache = Object.assign(rk, fitModel(rk));
   return affinityCache;
 }
 
 const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
-const rankScore = (p, rk, now) => topicWeight(p) * (rk.regionDown.get(p.region) ?? 1) * dot(rk.w, features(p, rk, now));
+const rankScore = (p, rk, now) => topicWeight(p) * (rk.regionDown.get(p.region) ?? 1) * (rk.regionUp.get(p.region) ?? 1)
+  * dot(rk.w, features(p, rk, now));
 
 const hideReason = (id) => state.hidden[id]?.reason || null;
 // "Not my area" turns a whole map region down: x0.75 per such hide, to a floor of 0.4. It's counted
@@ -364,6 +372,38 @@ function regionDownweights() {
   const n = new Map();
   for (const h of Object.values(state.hidden)) if (h?.reason === "area" && h.r != null) n.set(h.r, (n.get(h.r) || 0) + 1);
   return new Map([...n].map(([r, k]) => [r, Math.max(0.4, 0.75 ** k)]));
+}
+
+// Favorites calibrate the map's neighborhoods the other way: the region each ♥ sits in ranks a little
+// higher, x1.1 per favorite there, up to x1.3. A favorite outside the window has no region of its own,
+// so it takes the commonest one among its 8 nearest papers (weighted by similarity).
+const FAV_REGION_UP = 0.1, FAV_REGION_MAX = 1.3;
+function favoriteRegions() {
+  const out = new Map();
+  let withRegion = null;  // [vector row, region] for every paper that has a region
+  for (const id of Object.keys(state.favorites)) {
+    const own = byId.get(id)?.region;
+    if (own != null) { out.set(id, own); continue; }
+    const f = VEC ? vecRow({ id, aliases: favPaper(id)?.aliases }) : undefined;
+    if (f === undefined) continue;
+    withRegion ||= DATA.papers.filter((p) => p.region != null).map((p) => [vecRow(p), p.region]).filter(([r]) => r !== undefined);
+    const { dim, data, norms } = VEC, sims = [];
+    for (const [r, region] of withRegion) {
+      if (r === f) continue;
+      let d = 0; for (let j = 0; j < dim; j++) d += data[f * dim + j] * data[r * dim + j];
+      sims.push([d / (norms[f] * norms[r]), region]);
+    }
+    const votes = new Map();
+    for (const [sim, region] of sims.sort((a, b) => b[0] - a[0]).slice(0, 8)) votes.set(region, (votes.get(region) || 0) + sim);
+    const top = [...votes].sort((a, b) => b[1] - a[1])[0];
+    if (top) out.set(id, top[0]);
+  }
+  return out;
+}
+function regionUpweights(favRegions) {
+  const n = new Map();
+  for (const r of favRegions.values()) n.set(r, (n.get(r) || 0) + 1);
+  return new Map([...n].map(([r, k]) => [r, Math.min(FAV_REGION_MAX, 1 + FAV_REGION_UP * k)]));
 }
 
 // Re-rank the top of the list, in three steps:
@@ -481,7 +521,7 @@ function whyLine(p) {
     2: () => { const s = nearest("saved"); return s ? `like “${shortTitle(favPaper(s)?.title || state.saved[s]?.paper?.title, 4)}” you saved` : ""; },
     4: () => { const d = Math.round(Math.max(0, (Date.now() - Date.parse(p.date)) / DAY)); return d < 1 ? "today" : `${d}d old`; },
     5: () => "buzzing",
-    6: () => `PI · ${p.pis[0]}`,
+    6: () => `PI · ${myPis(p)[0]}`,
     7: () => `in ${p.venue}`,
   };
   return x.map((v, j) => [rk.w[j] * v, j]).filter(([c, j]) => c > 0.15 && say[j])
@@ -493,7 +533,7 @@ function rankFit(rk) {
   const now = Date.now(), cut = now - 30 * DAY;
   const recent = Object.entries(state.saved).filter(([id, s]) => entryTs(s) > cut && byId.has(id)).map(([id]) => byId.get(id));
   if (recent.length < 3) return null;
-  const pool = DATA.papers.filter((p) => (sectionTopics(p).length || p.pis?.length || (p.ai?.score ?? 0) >= 4) && !has(state.hidden, p));
+  const pool = DATA.papers.filter((p) => (sectionTopics(p).length || myPis(p).length || (p.ai?.score ?? 0) >= 4) && !has(state.hidden, p));
   const scores = pool.map((p) => rankScore(p, rk, now)).sort((a, b) => b - a);
   const top20 = scores[Math.min(19, scores.length - 1)];
   return { n: recent.length, inTop20: recent.filter((p) => rankScore(p, rk, now) >= top20).length };
@@ -539,6 +579,7 @@ function topicWeight(p) {
 // ---- tabs / filtering -----------------------------------------------------------
 
 function allTabs() {
+  if (!account.user) return [PUBLIC_TABS[state.section]];
   const { head, tail } = SECTION_TABS[state.section];
   const topicTabs = DATA.topics.filter((t) => (t.section || "bio") === state.section).map((t) => t.slug);
   const known = [...head, ...topicTabs, ...tail];
@@ -547,17 +588,44 @@ function allTabs() {
 }
 
 function tabInfo(slug) {
+  if (!account.user && slug === PUBLIC_TABS[state.section]) return { ...SPECIAL_TABS[slug], label: "Trending" };
   return SPECIAL_TABS[slug] || DATA.topics.find((t) => t.slug === slug) || { label: slug, color: "var(--muted)" };
 }
 
 function inTab(p, tab) {
   if (!(p.sections || ["bio"]).includes(state.section)) return false;
   // Journal papers that fit no topic tab still belong in For You when Claude rates them relevant.
-  if (tab === "foryou") return (sectionTopics(p).length || p.pis?.length || (p.ai?.score ?? 0) >= 4) && topicWeight(p) > 0;
+  if (tab === "foryou") return (sectionTopics(p).length || myPis(p).length || (p.ai?.score ?? 0) >= 4) && topicWeight(p) > 0;
   if (tab === "mlforyou") return topicWeight(p) > 0;
-  if (tab === "pis") return p.pis?.length > 0;
+  if (tab === "pis") return myPis(p).length > 0;
   if (HOT_TABS.has(tab)) return (p.buzz_score || 0) > 0;
   return p.topics?.includes(tab);
+}
+
+// Your watched PIs among a paper's authors. Matched like the build does (pipeline/tagging.py): last
+// name and first initial, accent-insensitive; the build's own `pis` tags count too, because long author
+// lists are cut down before they ship and a PI in the middle survives only as that tag.
+function nameParts(name) {
+  const parts = String(name).normalize("NFKD").replace(/[^\x00-\x7f]/g, "").toLowerCase().split(/[\s.]+/).filter(Boolean);
+  if (!parts.length) return ["", ""];
+  if (parts.length >= 2 && parts.at(-1).length === 1) return [parts.at(-1), parts[0]]; // "Uhler C"
+  return [parts[0], parts.at(-1)];
+}
+let piCache = { sig: null };
+function myPis(p) {
+  const sig = Object.keys(state.pis).join("|");
+  if (piCache.sig !== sig) {
+    piCache = { sig, hits: new Map(), list: Object.values(state.pis).map((x) => [x.name, ...nameParts(x.name)]) };
+  }
+  if (!piCache.list.length) return [];
+  let hit = piCache.hits.get(p.id);
+  if (!hit) {
+    const authors = (p.authors || []).map(nameParts);
+    hit = piCache.list.filter(([name, first, last]) => (p.pis || []).includes(name)
+      || authors.some(([f, l]) => l === last && f.slice(0, 1) === first.slice(0, 1))).map(([name]) => name);
+    piCache.hits.set(p.id, hit);
+  }
+  return hit;
 }
 
 // For You's filter chips: Must read, papers near any favorite, or near the favorites with one label.
@@ -579,12 +647,15 @@ function savedPapers() {
     .filter(Boolean);
 }
 
-const sortFor = (tab) => state.sortByTab[tab] || (HOT_TABS.has(tab) ? "buzz" : "foryou");
+const sortFor = (tab) => {
+  const sort = state.sortByTab[tab] || (HOT_TABS.has(tab) ? "buzz" : "foryou");
+  return !account.user && sort === "foryou" ? "buzz" : sort;  // signed out there's no For You ranking
+};
 
 function visiblePapers() {
   const tab = curTab();
   let list = tab === "saved" ? savedPapers() : DATA.papers.filter((p) => inTab(p, tab) && !has(state.hidden, p));
-  if (tab === "pis" && ui.pi) list = list.filter((p) => p.pis.includes(ui.pi));
+  if (tab === "pis" && ui.pi) list = list.filter((p) => myPis(p).includes(ui.pi));
   if ((tab === "foryou" || tab === "mlforyou") && ui.forYou) list = list.filter(forYouChip(ui.forYou));
   if ((tab === "foryou" || tab === "mlforyou") && ui.source) list = list.filter(sourceChip(ui.source));
   if (ui.newOnly) list = list.filter(isNew);
@@ -613,20 +684,28 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 
 function render({ keepPage = false } = {}) {
   if (!keepPage) ui.shown = PAGE;
-  const tabs = allTabs().filter((t) => !state.hiddenTabs.includes(t) || t === curTab());
-  if (!tabs.includes(curTab())) setTab(SECTION_TABS[state.section].head[0]);
+  const pub = !account.user;  // signed out: just what's trending
+  const tabs = allTabs().filter((t) => pub || !state.hiddenTabs.includes(t) || t === curTab());
+  if (!tabs.includes(curTab())) setTab(pub ? tabs[0] : SECTION_TABS[state.section].head[0]);
   const tab = curTab();
 
-  const graph = state.view === "graph";
+  const graph = !pub && state.view === "graph";
+  document.body.classList.toggle("signed-out", pub);
   $("sections").innerHTML = Object.entries(DATA.sections || {}).map(([k, label]) =>
     `<button data-section="${k}" class="${!graph && k === state.section ? "active" : ""}">${esc(label)}</button>`).join("")
-    + `<button data-view="graph" class="${graph ? "active" : ""}" title="Every paper laid out by similarity, centered on your ♥ favorites">Graph</button>`;
+    + (pub ? "" : `<button data-view="graph" class="${graph ? "active" : ""}" title="Every paper laid out by similarity, centered on your ♥ favorites">Graph</button>`);
 
   const updated = DATA.generated ? new Date(DATA.generated).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "—";
   const inSection = DATA.papers.filter((p) => (p.sections || ["bio"]).includes(state.section)).length;
   const loading = state.section === "ml" && !inSection ? "loading ML papers…" : `${inSection.toLocaleString()} papers`;
   $("sub").textContent = `${loading} · updated ${updated}`;
   document.body.classList.toggle("graph-mode", graph);
+  if (account.pending) {  // a stored session is being restored: don't flash the signed-out page
+    for (const id of ["tabs", "sortbar", "chips"]) $(id).innerHTML = "";
+    $("feed").innerHTML = `<div class="empty">Signing you in…</div>`;
+    $("more").hidden = true;
+    return;
+  }
   if (graph) { renderGraph(); return; }
 
   const visible = (p) => !has(state.hidden, p);
@@ -639,18 +718,19 @@ function render({ keepPage = false } = {}) {
   }).join("");
 
   const sort = sortFor(tab);
-  const sortLabel = (k, label) => k === "buzz" && state.section === "ml" ? "Hot" : label;
+  const sortLabel = (k, label) => k === "buzz" && (state.section === "ml" || pub) ? "Hot" : label;
   $("sortbar").innerHTML = tab === "saved" ? `<button class="active">Recently saved</button>`
-    : Object.entries(SORTS).map(([k, label]) =>
+    : Object.entries(SORTS).filter(([k]) => !pub || k !== "foryou").map(([k, label]) =>
         `<button data-sort="${k}" class="${k === sort ? "active" : ""}">${sortLabel(k, label)}</button>`).join("");
 
   const nNew = DATA.papers.filter((p) => isNew(p) && inTab(p, tab === "saved" ? SECTION_TABS[state.section].head[0] : tab)).length;
   $("new-label").textContent = prevVisitDay ? `new since last visit (${nNew})` : "new since last visit";
 
-  $("chips").innerHTML = tab === "pis"
-    ? [null, ...DATA.people.map((p) => p.name)].map((name) =>
-        `<button class="chip ${ui.pi === name ? "active" : ""}" data-pi="${esc(name ?? "")}"
-          title="${esc(DATA.people.find((x) => x.name === name)?.note || "")}">${esc(name ?? "All PIs")}</button>`).join("")
+  const myPiList = Object.values(state.pis).sort((a, b) => a.name.localeCompare(b.name));
+  $("chips").innerHTML = tab === "pis" && myPiList.length
+    ? [null, ...myPiList].map((x) =>
+        `<button class="chip ${ui.pi === (x?.name ?? null) ? "active" : ""}" data-pi="${esc(x?.name ?? "")}"
+          title="${esc(x?.inst || "")}">${esc(x?.name ?? "All PIs")}</button>`).join("")
     : tab === "foryou" || tab === "mlforyou"
     ? (() => {
         const base = DATA.papers.filter((p) => inTab(p, tab) && visible(p));
@@ -672,6 +752,7 @@ function render({ keepPage = false } = {}) {
   $("feed").innerHTML = list.length
     ? list.slice(0, ui.shown).map(card).join("")
     : `<div class="empty">${tab === "saved" ? "Nothing saved yet — hit ☆ on a paper."
+      : tab === "pis" && !Object.keys(state.pis).length ? "You aren't watching any PIs yet. Add some in ⚙︎ Settings → PI watchlist."
       : ui.forYou === "must" ? "Nothing in Must read yet. It fills in as the daily AI scoring runs."
       : ui.forYou ? "Nothing near your favorites yet (they need the embeddings, which load a few seconds after the page)."
       : "No papers match."}</div>`;
@@ -689,13 +770,14 @@ function card(p) {
   // Current section's topics first, so the card edge matches the tab you're in.
   const topics = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t)).filter(Boolean)
     .sort((a, b) => ((b.section || "bio") === state.section) - ((a.section || "bio") === state.section));
-  const color = topics[0]?.color || (p.pis?.length ? "#a98fd6" : (p.buzz_score ? "var(--hot)" : "var(--muted)"));
+  const pis = myPis(p);
+  const color = topics[0]?.color || (pis.length ? "#a98fd6" : (p.buzz_score ? "var(--hot)" : "var(--muted)"));
   const b = p.buzz || {}, hf = p.hf || {};
   const arxivId = p.doi?.startsWith("10.48550/arxiv.") ? p.doi.slice("10.48550/arxiv.".length) : null;
-  const lastNames = new Set((p.pis || []).map((n) => n.split(" ").pop().toLowerCase()));
+  const lastNames = new Set(pis.map((n) => nameParts(n)[1]));
   const authors = (p.authors || []).map((a) =>
-    lastNames.has(a.split(" ").pop().toLowerCase()) ? `<b>${esc(a)}</b>` : esc(a)).join(", ");
-  const saved = has(state.saved, p), fav = has(state.favorites, p);
+    lastNames.has(nameParts(a)[1]) ? `<b>${esc(a)}</b>` : esc(a)).join(", ");
+  const pub = !account.user, saved = has(state.saved, p), fav = has(state.favorites, p);
   const near = nearCache?.get(p.id);
   const hot = [
     hf.upvotes && arxivId ? `<a class="badge hot" href="https://huggingface.co/papers/${esc(arxivId)}" target="_blank" rel="noopener" title="Hugging Face Daily Papers upvotes">▲ ${hf.upvotes} HF</a>` : "",
@@ -714,11 +796,11 @@ function card(p) {
   ].filter(Boolean);
 
   return `<article class="paper" style="--c:${color}" data-id="${esc(p.id)}">
-    <div class="actions">
+    ${pub ? "" : `<div class="actions">
       <button class="${saved ? "on" : ""}" data-act="save" aria-label="Save" title="Save">${saved ? "★" : "☆"}</button>
       <button class="${fav ? "on fav" : ""}" data-act="fav" aria-label="Favorite" title="Favorite: a landmark paper the Graph and Near favorites center on">♥</button>
       <button class="hide" data-act="hide" aria-label="${curTab() === "saved" ? "Unsave" : "Not interested"}" title="${curTab() === "saved" ? "Unsave" : "Not interested: hide it, and rank papers like it lower"}">✕</button>
-    </div>
+    </div>`}
     <div class="body">
       <h3><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
       <div class="meta">
@@ -726,18 +808,18 @@ function card(p) {
         <span class="badge venue">${esc(p.venue)}${p.kind === "preprint" && !/rxiv/i.test(p.venue) ? " · preprint" : ""}</span>
         ${hf.org ? `<span class="badge org">${esc(hf.org)}</span>` : ""}
         <span class="date">${esc(p.date)}</span>
-        ${(p.pis || []).map((n) => `<span class="badge pi">PI · ${esc(n)}</span>`).join("")}
+        ${pis.map((n) => `<span class="badge pi">PI · ${esc(n)}</span>`).join("")}
         ${near ? `<span class="badge near" title="Near your favorite: ${esc(favPaper(near.fav)?.title)}">♥ ${esc(favLabel(near.fav))}</span>` : ""}
-        ${typeof p.ai?.score === "number" ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
+        ${!pub && typeof p.ai?.score === "number" ? `<span class="badge ai ${p.ai.score >= MUST_READ ? "hi" : ""}" title="Claude's relevance score for you: ${esc(p.ai.why)}">AI ${p.ai.score}</span>` : ""}
         ${hot}
         ${topics.map((t) => `<span class="badge" style="--c:${t.color}"${p.tagged_by ? ` title="Tagged from similar papers (no keyword matched)"` : ""}>${esc(t.label)}</span>`).join("")}
       </div>
       <div class="authors" title="${esc((p.authors || []).join(", "))}">${authors}${p.n_authors ? ` <span>(${p.n_authors})</span>` : ""}</div>
       ${showWhy(p) ? `<div class="why-line">${esc(whyLine(p))}</div>` : ""}
-      ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
+      ${p.ai?.tldr || hf.tldr ? `<div class="tldr"><b>TL;DR</b> ${esc(p.ai?.tldr || hf.tldr)}${!pub && p.ai?.why ? ` <span class="why">· ${esc(p.ai.why)}</span>` : ""}</div>` : ""}
       ${p.abstract ? `<div class="abstract">${esc(p.abstract)}</div>` : ""}
       ${takehomeHTML(p)}
-      <div class="links">${links.join("")}<button type="button" class="linkbtn th-btn" data-act="takehome" title="A short take-home summary, written on demand">${state.summaries[p.id] ? (ui.takehomeOpen.has(p.id) ? "hide take-home" : "take-home ✓") : "take-home"}</button><button type="button" class="linkbtn" data-act="map" title="Show it on the Graph with its nearest neighbours">similar papers</button></div>
+      <div class="links">${links.join("")}${pub ? "" : `<button type="button" class="linkbtn th-btn" data-act="takehome" title="A short take-home summary, written on demand">${state.summaries[p.id] ? (ui.takehomeOpen.has(p.id) ? "hide take-home" : "take-home ✓") : "take-home"}</button><button type="button" class="linkbtn" data-act="map" title="Show it on the Graph with its nearest neighbours">similar papers</button>`}</div>
     </div>
   </article>`;
 }
@@ -945,7 +1027,7 @@ function renderGraph() {
     if (!fav && state.graphSection !== "all" && !(p.sections || ["bio"]).includes(state.graphSection)) return;
     if (around && !fav && !near.has(id)) return;
     const topic = (p.topics || []).map((t) => DATA.topics.find((x) => x.slug === t)).find(Boolean);
-    mapPts.push({ i, p, fav, near: near.get(id), color: topic?.color || (p.pis?.length ? "#a98fd6" : muted),
+    mapPts.push({ i, p, fav, near: near.get(id), color: topic?.color || (myPis(p).length ? "#a98fd6" : muted),
                   liked: isLiked(p), dim: !matchesGraph(p) });
   });
   regionCounts = (MAP.regions || []).map(() => 0);
@@ -1116,6 +1198,7 @@ function placeFavorites() {
       placing = null;
       affinityCache = nearCache = null; mapNeedsFit = true;
       render({ keepPage: true });
+      if (ob) renderObFavs();
       if (Object.keys(state.favorites).some((id) => !MAP.index.has(id) && !placeStatus)) placeFavorites(); // ♥'d while we were busy
     }
   })();
@@ -1194,6 +1277,17 @@ function fromOpenAlex(w) {
   };
 }
 
+const OA_WORK_FIELDS = "id,doi,title,display_name,publication_date,publication_year,type,authorships,primary_location,abstract_inverted_index";
+// Papers from OpenAlex: the one a DOI / arXiv ID points to, or a title search.
+async function openAlexWorks(q, ref = paperRef(q)) {
+  const url = ref
+    ? `https://api.openalex.org/works/doi:${encodeURIComponent(ref)}?select=${OA_WORK_FIELDS}`
+    : `https://api.openalex.org/works?search=${encodeURIComponent(q)}&per-page=8&select=${OA_WORK_FIELDS}`;
+  const res = await fetch(url);
+  const body = res.ok ? await res.json() : null;
+  return (body?.results || (body?.id ? [body] : [])).map(fromOpenAlex);
+}
+
 let lookupSeq = 0;
 async function lookup(q) {
   const seq = ++lookupSeq, ref = paperRef(q), lq = q.toLowerCase(), graph = state.view === "graph";
@@ -1203,16 +1297,8 @@ async function lookup(q) {
   lookupResults = local.map((p) => ({ p, local: true }));
   renderLookup(q.length >= 3 ? "searching the literature…" : "");
   if (q.length < 3) return;
-  const select = "id,doi,title,display_name,publication_date,publication_year,type,authorships,primary_location,abstract_inverted_index";
-  const url = ref
-    ? `https://api.openalex.org/works/doi:${encodeURIComponent(ref)}?select=${select}`
-    : `https://api.openalex.org/works?search=${encodeURIComponent(q)}&per-page=8&select=${select}`;
   let remote = [];
-  try {
-    const res = await fetch(url);
-    const body = res.ok ? await res.json() : null;
-    remote = (body?.results || (body?.id ? [body] : [])).map(fromOpenAlex);
-  } catch { /* offline: local results only */ }
+  try { remote = await openAlexWorks(q, ref); } catch { /* offline: local results only */ }
   if (seq !== lookupSeq) return;
   const seen = new Set(lookupResults.map((r) => r.p.id));
   for (const p of remote) {
@@ -1488,6 +1574,8 @@ function renderSettings() {
   renderAccount();
   renderSync();
   renderTakehomeSettings();
+  if (!$("pi-box").firstChild) $("pi-box").innerHTML = piEditorHTML();
+  renderPiEditors();
 
   const tabs = allTabs();
   $("tabs-section").textContent = `— ${DATA.sections?.[state.section] || ""}`;
@@ -1577,6 +1665,347 @@ $("reset").addEventListener("click", () => {
   persist(); affinityCache = nearCache = null; renderSettings(); render();
 });
 
+// ---- PI watchlist ------------------------------------------------------------------------
+// Everyone watches their own PIs (state.pis, synced with the account). Their papers fill the PI Watch
+// tab and get the "watched PI" boost in For You. PIs are found with OpenAlex's author search, so each
+// has an OpenAlex ID: the daily build reads everyone's IDs (pipeline/users.py) to fetch their papers from
+// journals we have no feed for, and keeps those papers for six months.
+
+const nameKey = (name) => { const [first, last] = nameParts(name); return `${first.slice(0, 1)} ${last}`; };
+let piFind = { results: [], status: "" }, piSeq = 0, piTimer = null;
+
+async function findAuthors(q) {
+  const seq = ++piSeq;
+  piFind = { results: [], status: q.length >= 3 ? "searching OpenAlex…" : "" };
+  renderPiEditors();
+  if (q.length < 3) return;
+  try {
+    const res = await fetch(`https://api.openalex.org/authors?search=${encodeURIComponent(q)}&per-page=6&select=id,display_name,last_known_institutions,works_count`);
+    const body = res.ok ? await res.json() : null;
+    if (seq !== piSeq) return;
+    piFind.results = (body?.results || []).map((a) => ({ name: a.display_name, openalex: a.id.split("/").pop(),
+      inst: a.last_known_institutions?.[0]?.display_name || "", works: a.works_count || 0 }));
+    piFind.status = piFind.results.length ? "" : "No one by that name in OpenAlex.";
+  } catch {
+    if (seq === piSeq) piFind.status = "Couldn't reach OpenAlex.";
+  }
+  renderPiEditors();
+}
+
+// Worth suggesting: the last authors of your favorites (usually the PI), then the site's own list.
+function piSuggestions() {
+  const taken = new Set(Object.values(state.pis).map((x) => nameKey(x.name))), counts = new Map();
+  for (const id of Object.keys(state.favorites)) {
+    const last = (favPaper(id)?.authors || []).filter((a) => a !== "…").at(-1);
+    if (last) counts.set(last, (counts.get(last) || 0) + 1);
+  }
+  const names = [...[...counts].sort((a, b) => b[1] - a[1]).map(([n]) => n), ...(DATA.people || []).map((p) => p.name)];
+  return names.filter((n) => !taken.has(nameKey(n)) && taken.add(nameKey(n))).slice(0, 8);
+}
+
+// The editor (in ⚙︎ and in onboarding): this static part once, then renderPiEditors fills it in, so the
+// search box keeps its focus while results come back.
+const piEditorHTML = () => `<div class="pi-editor">
+  <ul class="pi-list"></ul>
+  <div class="pi-sugg"></div>
+  <input type="search" class="pi-search" placeholder="Find a PI by name" aria-label="Find a PI" autocomplete="off">
+  <ul class="pi-results"></ul>
+</div>`;
+
+function renderPiEditors() {
+  const pis = Object.entries(state.pis).sort((a, b) => a[1].name.localeCompare(b[1].name));
+  const sugg = piSuggestions(), watching = new Set(Object.keys(state.pis));
+  for (const box of document.querySelectorAll(".pi-editor")) {
+    box.querySelector(".pi-list").innerHTML = pis.length
+      ? pis.map(([k, x]) => `<li data-pikey="${esc(k)}"><span class="pi-name">${esc(x.name)}</span>
+          <span class="pi-inst">${esc(x.inst || "")}</span>
+          <button type="button" class="rm" data-piact="remove" aria-label="Stop watching ${esc(x.name)}" title="Stop watching">✕</button></li>`).join("")
+      : `<li class="hint">Not watching anyone yet.</li>`;
+    box.querySelector(".pi-sugg").innerHTML = sugg.length ? `<span class="hint">Suggested:</span> ${sugg.map((n) =>
+      `<button type="button" class="chip" data-piact="suggest" data-name="${esc(n)}">+ ${esc(n)}</button>`).join("")}` : "";
+    box.querySelector(".pi-results").innerHTML = piFind.results.map((a, i) => `<li>
+        <div class="lk-body">${esc(a.name)}<div class="lk-meta">${esc([a.inst, `${a.works.toLocaleString()} works`].filter(Boolean).join(" · "))}</div></div>
+        <button type="button" class="lk-show" data-piact="add" data-i="${i}" ${watching.has(a.openalex) ? "disabled" : ""}>${watching.has(a.openalex) ? "watching" : "watch"}</button>
+      </li>`).join("") + (piFind.status ? `<li class="lk-status">${esc(piFind.status)}</li>` : "");
+  }
+}
+
+function watchPi(a) {
+  state.pis[a.openalex || nameKey(a.name)] = { ts: Date.now(), name: a.name,
+    ...(a.openalex ? { openalex: a.openalex } : {}), ...(a.inst ? { inst: a.inst } : {}) };
+  affinityCache = null; persist(); renderPiEditors();
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest(".pi-editor [data-piact]");
+  if (!b) return;
+  const act = b.dataset.piact;
+  if (act === "remove") { forget("pis", [b.closest("[data-pikey]").dataset.pikey]); affinityCache = null; persist(); renderPiEditors(); }
+  if (act === "add") watchPi(piFind.results[+b.dataset.i]);
+  if (act === "suggest") {
+    // From the site's list we already know who it is; anyone else could be several people: search.
+    const known = DATA.people?.find((p) => p.name === b.dataset.name && p.openalex);
+    if (known) { watchPi(known); return; }
+    b.closest(".pi-editor").querySelector(".pi-search").value = b.dataset.name;
+    findAuthors(b.dataset.name);
+  }
+});
+document.addEventListener("input", (e) => {
+  if (!e.target.matches(".pi-search")) return;
+  clearTimeout(piTimer);
+  piTimer = setTimeout(() => findAuthors(e.target.value.trim()), 300);
+});
+// Enter in a search box inside a dialog would submit (and close) it.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.matches("dialog input[type=search]")) e.preventDefault();
+});
+
+// ---- onboarding ------------------------------------------------------------------------
+// The first time someone signs in, four short steps set up their feed:
+//   1. About you: a few sentences on what they work on. Saved as their interests (what Claude scores
+//      papers for), and used right away to suggest topic tabs.
+//   2. Tabs: every topic, the suggested ones ticked. Unticked tabs are hidden, and their papers count
+//      for a quarter in For You.
+//   3. Favorite papers: landmarks the Graph centers on. Papers near them rank higher, and so does the
+//      map neighborhood each one sits in (favoriteRegions).
+//   4. PIs to watch, suggested from the favorites' last authors.
+// Skipping marks it done; ⚙︎ → Account → "Set up my feed again" brings it back.
+
+const OB_STEPS = ["about", "tabs", "favs", "pis"];
+const OFF_TAB_WEIGHT = 0.25;
+let ob = null, obDismissed = false, obSeq = 0, obTimer = null;
+
+// Topic tabs suggested from a description. It's split into phrases ("CRISPR screens", "T cell
+// exhaustion", …), each phrase finds its 40 nearest papers, and a topic is suggested when it's
+// over-represented among them (3x its usual share or more): ticked at 40%+ of some phrase's
+// neighbours, offered as a maybe at 15%+. A topic named in the text is ticked too.
+const SUGGEST_K = 40;
+const QUERY_PREFIX = "Represent this sentence for searching relevant passages: "; // bge's prefix for short queries
+const GENERIC_LABELS = new Set(["micro", "viral", "systems", "efficiency", "theory", "optimization", "safety",
+  "reasoning", "vision", "multimodal", "agents"]);
+
+function descriptionPhrases(text) {
+  const out = [];
+  for (const raw of text.replace(/^#.*$/gm, "").split(/[.;\n]+|,\s+(?:and\s+)?|\band\b/)) {
+    const x = raw.replace(/^[\s*-]+|[\s*-]+$/g, "");
+    if (!x) continue;
+    if (out.length && x.split(/\s+/).length < 2) out[out.length - 1] += ` ${x}`;  // one word means little alone
+    else out.push(x);
+  }
+  return out.slice(0, 40);
+}
+
+function labelHit(text, t) {
+  const lower = ` ${text.toLowerCase()} `;
+  return t.label.split(/\s*[/&]\s*|\s+and\s+/).map((s) => s.trim())
+    .filter((s) => s.length >= 2 && !GENERIC_LABELS.has(s.toLowerCase()))
+    .find((s) => new RegExp(`[^a-z0-9]${s.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/s$/, "")}s?[^a-z0-9]`).test(lower));
+}
+
+async function suggestTabs(text) {
+  const out = new Map();  // slug -> { strong, share, why }
+  for (const t of DATA.topics) {
+    const hit = labelHit(text, t);
+    if (hit) out.set(t.slug, { strong: true, share: 1, why: `you mentioned ${hit}` });
+  }
+  const phrases = descriptionPhrases(text);
+  await Promise.all([loadVectors(), loadML()]);
+  if (!phrases.length || !VEC) return out;
+  const qs = await embedInBrowser(phrases.map((x) => QUERY_PREFIX + x));
+  const rows = DATA.papers.filter((p) => p.topics?.length).map((p) => [vecRow(p), p.topics]).filter(([r]) => r !== undefined);
+  const usual = new Map();
+  for (const [, ts] of rows) for (const t of ts) usual.set(t, (usual.get(t) || 0) + 1 / rows.length);
+  const { dim, data, norms } = VEC;
+  phrases.forEach((phrase, k) => {
+    const q = qs[k];
+    const sims = rows.map(([r], i) => {
+      let d = 0; for (let j = 0; j < dim; j++) d += q[j] * data[r * dim + j];
+      return [d / norms[r], i];  // the query's own norm doesn't change the order
+    }).sort((a, b) => b[0] - a[0]).slice(0, SUGGEST_K);
+    const share = new Map();
+    for (const [, i] of sims) for (const t of rows[i][1]) share.set(t, (share.get(t) || 0) + 1 / SUGGEST_K);
+    for (const [t, sh] of share) {
+      if (sh < 0.15 || sh < 3 * usual.get(t)) continue;
+      const strong = sh >= 0.4, prev = out.get(t);
+      if (!prev || (strong && !prev.strong) || (strong === prev.strong && sh > prev.share)) {
+        out.set(t, { strong, share: sh, why: `“${shortTitle(phrase, 6)}”` });
+      }
+    }
+  });
+  return out;
+}
+
+function maybeOnboard() {
+  if (account.user && account.profile && !account.profile.onboarded && DATA.generated && !ob && !obDismissed) startOnboarding();
+}
+
+function startOnboarding() {
+  ob = { step: 0, interests: account.profile?.interests || "", suggest: null, suggestedFor: null,
+    checked: new Set(DATA.topics.map((t) => t.slug).filter((t) => !state.hiddenTabs.includes(t))),
+    found: [], status: "", busy: null, error: null };
+  loadVectors(); loadML(); loadMap();  // for tab suggestions, and to place favorites on the map
+  renderOnboarding();
+  if (!$("onboard").open) $("onboard").showModal();
+}
+
+function renderOnboarding() {
+  const step = OB_STEPS[ob.step], last = ob.step === OB_STEPS.length - 1;
+  $("ob-step").textContent = `Step ${ob.step + 1} of ${OB_STEPS.length}`;
+  $("ob-back").hidden = ob.step === 0;
+  $("ob-back").disabled = !!ob.busy;
+  $("ob-next").textContent = last ? "Finish" : "Next";
+  $("ob-next").disabled = !!ob.busy;
+  $("ob-error").textContent = ob.error || "";
+  const body = $("ob-body");
+  if (step === "about") {
+    body.innerHTML = `<h3>What do you work on?</h3>
+      <p class="hint">A few sentences, like a note to a colleague: your field, the questions you care about,
+        what makes a paper a must-read for you, and what to skip. It suggests your tabs next, and it's what
+        Claude scores new papers against.</p>
+      <textarea id="ob-interests" rows="8" placeholder="I study how T cells become exhausted in tumors, mostly with CRISPR screens and single-cell sequencing…">${esc(ob.interests)}</textarea>`;
+  }
+  if (step === "tabs") {
+    if (ob.busy) { body.innerHTML = `<h3>Your tabs</h3><p class="hint">${esc(ob.busy)}</p>`; return; }
+    const sug = ob.suggest || new Map();
+    const rank = (t) => (sug.get(t.slug)?.strong ? 0 : sug.has(t.slug) ? 1 : 2);
+    body.innerHTML = `<h3>Your tabs</h3>
+      <p class="hint">${sug.size ? "Ticked from what you wrote; “maybe” ones are close." : "Pick the topics you want as tabs."}
+        Unticked tabs are hidden, and their papers count for less in For You. You can change this any time in ⚙︎.</p>
+      ${Object.entries(DATA.sections || {}).map(([sec, label]) => `<h4>${esc(label)}</h4><ul class="ob-tabs">${
+        DATA.topics.filter((t) => (t.section || "bio") === sec).sort((a, b) => rank(a) - rank(b)).map((t) => {
+          const s = sug.get(t.slug);
+          return `<li><label><input type="checkbox" data-obtab="${esc(t.slug)}" ${ob.checked.has(t.slug) ? "checked" : ""}>
+            <span class="dot" style="--c:${t.color}"></span>${esc(t.label)}</label>
+            ${s ? `<span class="ob-why ${s.strong ? "" : "maybe"}">${s.strong ? "suggested" : "maybe"} · ${esc(s.why)}</span>` : ""}</li>`;
+        }).join("")}</ul>`).join("")}`;
+  }
+  if (step === "favs") {
+    body.innerHTML = `<h3>Papers you love</h3>
+      <p class="hint">Three or more that define your taste: classics, your own, the ones you send everyone. The
+        Graph centers on them, papers near them rank higher, and so does the neighborhood of the map each one
+        sits in.</p>
+      <input type="search" id="ob-find" placeholder="Title, DOI or arXiv ID" aria-label="Find a paper" autocomplete="off">
+      <ul class="ob-found lookup-list"></ul>
+      <div class="ob-favs"></div>`;
+    renderObFavs();
+  }
+  if (step === "pis") {
+    body.innerHTML = `<h3>PIs to watch</h3>
+      <p class="hint">Every new paper with one of them as an author lands in your PI Watch tab and ranks higher in
+        For You. Suggestions come from your favorites' last authors.</p>${piEditorHTML()}`;
+    renderPiEditors();
+  }
+}
+
+function renderObFavs() {
+  if (!ob || OB_STEPS[ob.step] !== "favs") return;
+  const row = (p, i) => {
+    const fav = has(state.favorites, p);
+    const meta = [p.venue, (p.date || "").slice(0, 4), (p.authors || []).filter((a) => a !== "…").slice(0, 3).join(", ")].filter(Boolean).join(" · ");
+    return `<li><button type="button" class="heart ${fav ? "on" : ""}" data-obfav="${i}" aria-label="${fav ? "Remove favorite" : "Add to favorites"}">♥</button>
+      <div class="lk-body">${esc(p.title)}<div class="lk-meta">${esc(meta)}</div></div></li>`;
+  };
+  document.querySelector(".ob-found").innerHTML = ob.found.map(row).join("") + (ob.status ? `<li class="lk-status">${esc(ob.status)}</li>` : "");
+  const favs = Object.entries(state.favorites).sort((a, b) => b[1].ts - a[1].ts);
+  const regions = favoriteRegions(), names = DATA.regions || [];
+  const hoods = new Map();
+  for (const r of regions.values()) if (names[r]) hoods.set(names[r], (hoods.get(names[r]) || 0) + 1);
+  document.querySelector(".ob-favs").innerHTML = `<h4>Your favorites <span class="n">${favs.length}</span></h4>
+    ${favs.length ? `<ul class="ob-favlist">${favs.map(([id]) => {
+      const r = regions.get(id);
+      return `<li><span class="t">${esc(favPaper(id)?.title || id)}</span>
+        <span class="ob-why">${names[r] ? esc(names[r]) : placing ? "placing…" : ""}</span>
+        <button type="button" class="rm" data-obunfav="${esc(id)}" aria-label="Remove favorite" title="Remove">✕</button></li>`;
+    }).join("")}</ul>` : `<p class="hint">None yet. Search above, or ♥ papers in the feed later.</p>`}
+    ${hoods.size ? `<p class="hint">They anchor ${hoods.size === 1 ? "this neighborhood" : `these ${hoods.size} neighborhoods`} of the map:
+      ${[...hoods].sort((a, b) => b[1] - a[1]).map(([n, k]) => `<b>${esc(n)}</b>${k > 1 ? ` (${k})` : ""}`).join(", ")}.</p>` : ""}
+    ${placeStatus && placeStatus !== "loading" ? `<p class="hint">${esc(placeStatus)}</p>` : ""}`;
+}
+
+async function obFind(q) {
+  const seq = ++obSeq;
+  ob.found = []; ob.status = q.length >= 3 ? "searching…" : "";
+  renderObFavs();
+  if (q.length < 3) return;
+  const ref = paperRef(q), lq = q.toLowerCase();
+  const local = ref && byId.has(ref) ? [byId.get(ref)] : [...byId.values()].filter((p) => p.title.toLowerCase().includes(lq)).slice(0, 3);
+  let remote = [];
+  try { remote = await openAlexWorks(q, ref); } catch { /* offline: local results only */ }
+  if (seq !== obSeq || !ob) return;
+  const seen = new Set();
+  ob.found = [...local, ...remote.map((p) => byId.get(p.id) || p)].filter((p) => !seen.has(p.id) && seen.add(p.id)).slice(0, 8);
+  ob.status = ob.found.length ? "" : "No papers found.";
+  renderObFavs();
+}
+
+async function obNext(dir) {
+  if (OB_STEPS[ob.step] === "about") ob.interests = $("ob-interests").value;
+  ob.error = null;
+  if (dir > 0 && ob.step === OB_STEPS.length - 1) { await finishOnboarding(false); return; }
+  ob.step = Math.max(0, Math.min(OB_STEPS.length - 1, ob.step + dir));
+  const suggest = OB_STEPS[ob.step] === "tabs" && ob.interests.trim() && ob.suggestedFor !== ob.interests;
+  if (suggest) ob.busy = `Matching what you wrote to topics…${extractor ? "" : " (the first time downloads a 34 MB model)"}`;
+  renderOnboarding();
+  if (!suggest) return;
+  const o = ob;
+  try {
+    o.suggest = await suggestTabs(o.interests);
+    o.suggestedFor = o.interests;
+    const strong = [...o.suggest].filter(([, x]) => x.strong).map(([t]) => t);
+    if (strong.length) o.checked = new Set(strong);
+  } catch (err) {
+    o.error = `Couldn't suggest tabs (${err.message}). Pick them yourself.`;
+  }
+  o.busy = null;
+  if (ob === o) renderOnboarding();  // unless the dialog was closed meanwhile
+}
+
+async function finishOnboarding(skip) {
+  ob.busy = "Saving…"; renderOnboarding();
+  try {
+    if (!skip) {
+      if (ob.interests.trim() !== (account.profile?.interests || "").trim()) await saveInterests(ob.interests.trim());
+      for (const t of DATA.topics) {
+        const on = ob.checked.has(t.slug);
+        state.hiddenTabs = on ? state.hiddenTabs.filter((x) => x !== t.slug) : [...new Set([...state.hiddenTabs, t.slug])];
+        if (!on) state.topicWeights[t.slug] = Math.min(state.topicWeights[t.slug] ?? 1, OFF_TAB_WEIGHT);
+        else if (state.topicWeights[t.slug] === OFF_TAB_WEIGHT) delete state.topicWeights[t.slug];
+      }
+      persist();
+    }
+    const { error } = await SB.from("profiles").update({ onboarded: true, updated_at: new Date().toISOString() }).eq("user_id", uid());
+    if (error) throw new Error(error.message);
+    account.profile = { ...account.profile, onboarded: true };
+  } catch (err) {
+    ob.busy = null; ob.error = `Couldn't save: ${err.message}`; renderOnboarding();
+    return;
+  }
+  ob = null;
+  $("onboard").close();
+  affinityCache = nearCache = null;
+  render();
+}
+
+$("ob-next").addEventListener("click", () => obNext(1));
+$("ob-back").addEventListener("click", () => obNext(-1));
+$("ob-skip").addEventListener("click", () => finishOnboarding(true));
+$("onboard").addEventListener("close", () => { if (ob) { ob = null; obDismissed = true; } });  // Esc: ask again next visit
+$("ob-body").addEventListener("change", (e) => {
+  const t = e.target.dataset.obtab;
+  if (t) e.target.checked ? ob.checked.add(t) : ob.checked.delete(t);
+});
+$("ob-body").addEventListener("input", (e) => {
+  if (e.target.id !== "ob-find") return;
+  clearTimeout(obTimer);
+  obTimer = setTimeout(() => obFind(e.target.value.trim()), 300);
+});
+$("ob-body").addEventListener("click", (e) => {
+  const add = e.target.closest("[data-obfav]"), rm = e.target.closest("[data-obunfav]");
+  if (add) toggleFavorite(ob.found[+add.dataset.obfav]);
+  if (rm) { forget("favorites", [rm.dataset.obunfav]); affinityCache = nearCache = null; mapNeedsFit = true; }
+  if (add || rm) { persist(); renderObFavs(); }
+});
+
 // ---- accounts (Supabase) ---------------------------------------------------------------
 // Signed in, your state syncs to your own row in Supabase (user_state) instead of a gist, take-homes
 // go to their own table, and your interests text (what the daily build has Claude score papers for)
@@ -1590,6 +2019,14 @@ const SB = window.supabase?.createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, flowType: "pkce" },
 });
 const redirectTo = () => location.origin + location.pathname;
+// A session stored in this browser takes a moment to restore; until then show "signing in", not the
+// signed-out page (onAuthStateChange settles it either way).
+account.pending = !!SB && (() => {
+  if (new URLSearchParams(location.search).has("code")) return true;  // back from a sign-in link
+  try { return !!localStorage.getItem(`sb-${new URL(SUPABASE_URL).hostname.split(".")[0]}-auth-token`); } catch { return false; }
+})();
+const settlePending = () => { if (account.pending) { account.pending = false; if (DATA.generated) render({ keepPage: true }); } };
+setTimeout(settlePending, 10000);  // never hang on it
 
 async function sbRead() {
   const { data, error } = await SB.from("user_state").select("state, rev").eq("user_id", uid()).maybeSingle();
@@ -1691,8 +2128,10 @@ async function onSignedIn(user) {
   } catch (err) {
     account.error = err.message;
   }
+  account.pending = false;
   renderAccountButton();
   if (DATA.generated) render({ keepPage: true });
+  maybeOnboard();
 }
 
 function onSignedOut() {
@@ -1730,6 +2169,7 @@ function renderAccount() {
       fields, what makes a paper a must-read for you, what to skip.</label>
     <textarea id="acct-interests" rows="7" placeholder="I work on…">${esc(account.profile?.interests || "")}</textarea>
     <div class="btnrow"><button type="button" data-acct="save-interests">Save interests</button>
+      <button type="button" data-acct="onboard">Set up my feed again</button>
       <button type="button" data-acct="signout">Sign out</button></div>${err}`;
 }
 
@@ -1752,6 +2192,7 @@ $("account-box").addEventListener("click", async (e) => {
       return;
     }
     if (act === "save-interests") { await saveInterests($("acct-interests").value); e.target.textContent = "Saved ✓"; return; }
+    if (act === "onboard") { $("settings").close(); obDismissed = false; startOnboarding(); return; }
     if (act === "signout") { await SB.auth.signOut(); }
   } catch (err) {
     account.error = /signups not allowed|not allowed/i.test(err.message) ? "That account isn't invited yet. Ask the site owner to invite you." : err.message;
@@ -1937,7 +2378,7 @@ document.addEventListener("visibilitychange", () => {
 if (SB) {
   SB.auth.onAuthStateChange((event, session) => {
     if (session?.user) setTimeout(() => onSignedIn(session.user), 0);  // not inside Supabase's callback
-    else if (event === "SIGNED_OUT") onSignedOut();
+    else { if (event === "SIGNED_OUT") onSignedOut(); settlePending(); }
   });
 }
 renderAccountButton();

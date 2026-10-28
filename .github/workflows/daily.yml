@@ -58,6 +58,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           BIOPAPERS_GIST_ID: ${{ vars.BIOPAPERS_GIST_ID }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}  # reads users' PI watchlists
         run: |
           python -m pipeline.build \
             --days "${{ inputs.days || '3' }}" \

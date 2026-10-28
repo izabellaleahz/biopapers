@@ -53,7 +53,7 @@ All in `config/` — edit, push, and the next build picks it up (and re-tags eve
 | File | What it controls |
 |------|------------------|
 | `config/topics.yaml` | Sections + interest tabs: keywords, journals, preprint categories, OpenAlex searches |
-| `config/people.yaml` | PI watchlist (Uhler, Hacohen, Spranger) — name + OpenAlex ID |
+| `config/people.yaml` | The site's PI list (Uhler, Hacohen, Spranger): name + OpenAlex ID. It's suggested at onboarding and drives `alerts.xml`. Each user's own watchlist is in their account. |
 | `config/sources.yaml` | Journal RSS feeds, OpenAlex-by-ISSN journals, ML arXiv categories + HF, buzz sources |
 | `config/profile.md` | Who the AI scorer is reading for — plain prose; edit it to change what counts as a must-read |
 
@@ -108,8 +108,26 @@ Authentication → Users). Signed in, your saves / favorites / hides / settings 
 take-homes to `summaries`, and your interests text, what Claude scores papers for, lives on your
 profile (⚙︎ → Account). Every table has row-level security: each person reads and writes only their
 own rows. The site holds only the publishable key; the build fails if a secret key shows up in
-`site/`. Schema: `backend/supabase/schema.sql` (run once in the SQL editor). Signed out, the site works
-as before, with optional Gist sync.
+`site/`. Schema: `backend/supabase/schema.sql` (run once in the SQL editor).
+
+Signed out, the site is a public "what's trending" page: one Trending tab per section, with no
+personal tabs, ranking, Claude scores or ⚙︎.
+
+**Onboarding.** The first sign-in walks through four steps (skippable; ⚙︎ → Account → "Set up my feed
+again" redoes it):
+1. **About you.** A short description, saved as the interests text.
+2. **Tabs.** Suggested from that description. It's split into phrases, and each phrase's 40 nearest papers
+   (embedded in the browser with the build's model) vote for their topics. A topic is ticked if it's 40%+
+   of some phrase's neighbours (and 3x its usual share), or if its name is in the text. Unticked tabs
+   are hidden and weighted 0.25 in For You.
+3. **Favorite papers.** These seed the Graph, and each one calibrates its map neighborhood: that region
+   ranks x1.1 per favorite, up to x1.3.
+4. **PIs to watch.** Suggested from the favorites' last authors.
+
+**PI watchlists are per user** (`pis` in the synced state). The site matches them against author lists
+itself. With the `SUPABASE_SERVICE_KEY` secret set, the daily build (`pipeline/users.py`) also reads
+everyone's PIs, fetches their papers from OpenAlex and keeps them 180 days. `config/people.yaml` is
+still the site's own list: it's offered as suggestions and is what `alerts.xml` covers.
 
 ## Run locally
 

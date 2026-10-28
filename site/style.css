@@ -216,3 +216,42 @@ body.graph-mode #tabs, body.graph-mode #chips, body.graph-mode #sortbar, body.gr
   header .sections { order:3; flex:1 1 100%; }   /* Bio | ML / CS | Graph gets its own row */
 }
 .badge.venue { max-width:min(100%, 280px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* ---- signed out: just what's trending ---- */
+body.signed-out #open-settings, body.signed-out .lookup-results .heart { display:none; }
+body.signed-out .settings > section:not(.acct) { display:none; }
+
+/* ---- PI watchlist ---- */
+.pi-editor ul { list-style:none; margin:0; padding:0; }
+.pi-list li { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid var(--line); font-size:13px; }
+.pi-list .pi-name { font-weight:600; }
+.pi-list .pi-inst { flex:1; min-width:0; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pi-list .rm, .ob-favlist .rm { cursor:pointer; border:0; background:none; color:var(--muted); flex:none; }
+.pi-sugg { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:10px 0 8px; }
+.pi-sugg:empty { display:none; }
+.pi-sugg .hint { margin:0; }
+.pi-search, #ob-find { width:100%; border:1px solid var(--line); background:var(--bg); color:inherit; border-radius:8px; padding:6px 10px; font-size:13px; margin-top:8px; }
+.pi-results li, .ob-found li { display:flex; align-items:flex-start; gap:10px; padding:7px 2px; border-bottom:1px solid var(--line); }
+.pi-results li.lk-status, .ob-found li.lk-status { border:0; padding:6px 2px; }
+.lk-show:disabled { cursor:default; color:var(--muted); }
+
+/* ---- onboarding ---- */
+.onboard h3 { margin:14px 0 4px; }
+.onboard h4 { margin:14px 0 4px; font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+.onboard h4 .n { font-weight:400; }
+#ob-interests { width:100%; border:1px solid var(--line); background:var(--bg); color:inherit; border-radius:8px; padding:8px 10px; font:inherit; font-size:13px; resize:vertical; }
+.ob-tabs, .ob-found, .ob-favlist { list-style:none; margin:0; padding:0; }
+.ob-tabs li { display:flex; flex-wrap:wrap; align-items:center; gap:4px 10px; padding:4px 0; font-size:13px; }
+.ob-tabs label { display:flex; align-items:center; gap:7px; cursor:pointer; }
+.ob-tabs .dot { width:9px; height:9px; border-radius:50%; background:var(--c); flex:0 0 auto; }
+.ob-why { color:var(--accent); font-size:11px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ob-why.maybe { color:var(--muted); }
+.ob-favlist li { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid var(--line); font-size:13px; }
+.ob-favlist .t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ob-favlist .ob-why { flex:0 1 40%; text-align:right; }
+.ob-nav { margin-top:16px; align-items:center; }
+.ob-nav .grow { flex:1; }
+.ob-nav .primary { background:var(--ink); color:var(--bg); border-color:var(--ink); font-weight:600; }
+.ob-nav .primary:disabled { opacity:.5; cursor:default; }
+.ob-nav .quiet { border:0; background:none; color:var(--muted); padding-left:0; }
+#ob-error:empty { display:none; }
