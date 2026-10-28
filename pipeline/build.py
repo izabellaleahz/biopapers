@@ -39,7 +39,7 @@ RECENT_DAYS = 10  # papers.json = last 10 days (loads first); older.json = the r
 ALERTS_PATH = ROOT / "site" / "alerts.xml"
 ALL_SOURCES = ["biorxiv", "medrxiv", "arxiv", "rss", "openalex", "search", "pis", "ml", "hf", "buzz",
                "embed", "ai"]  # the last two are enrichment steps, not sources
-BUZZ_ALERT_SCORE = 8       # bio: e.g. 6 people sharing it, ~100 HN points, or 3 press stories (see buzz_score)
+BUZZ_ALERT_SCORE = 8       # bio: e.g. 4–6 people sharing it, or ~100 HN points (see buzz_score)
 BUZZ_ALERT_SCORE_ML = 15   # ML-only: ~7 people sharing it, plus HN or HF upvotes — ML gets far more attention
 BUZZ_STATE_DAYS = 30       # forget who shared a paper this long after anyone last did
 BUZZ_REVIVE = 5            # a paper over a month old counts as hot again only with this much buzz (~3 people)
@@ -265,11 +265,12 @@ def buzz_score(b: dict, hf: dict | None) -> float:
     account, 2), scaled up to ~2-3x by how much engagement their posts got, so ten people sharing a
     paper beat one big account with 300 likes. HN points and HF upvotes count on a log scale (both run
     into the hundreds); HF's lightly — upvotes there come mostly from the authors' own circle, so ~300
-    count about as much as two people on X."""
+    count about as much as two people on X. A press story (ScienceDaily: press releases) counts less
+    than one person sharing it."""
     def shared(n, eng):
         return n * (1 + math.log10(1 + eng / n) / 2) if n else 0
     return round(shared(b.get("x", 0) + len(b.get("x_by", [])), b.get("x_likes", 0))
-                 + 4 * math.log10(1 + b.get("hn", 0)) + 3 * len(b.get("news", []))
+                 + 4 * math.log10(1 + b.get("hn", 0)) + 1.5 * len(b.get("news", []))
                  + 1.25 * math.log2(1 + (hf or {}).get("upvotes", 0) / 25), 2)
 
 
